@@ -1,6 +1,10 @@
 'use strict';
 
 const diagReasonLabels = {
+  category_real_below_min:'Peso real menor al rango de categoría',
+  category_real_above_max:'Peso real mayor al rango de categoría',
+  category_volume_below_min:'Peso volumétrico menor al rango de categoría',
+  category_volume_above_max:'Peso volumétrico mayor al rango de categoría',
   billed_size_mismatch:'Talla declarada distinta del cálculo',
   invalid_physical_data:'Datos físicos inválidos o incompletos',
   table_gap:'Peso entre intervalos de la tabla',

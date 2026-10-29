@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=400000)
+    parser.add_argument("--with-category-rules", action="store_true", help="Evaluar 100 reglas ficticias de categoría durante la carga")
     args = parser.parse_args()
     if args.rows < 1:
         parser.error("--rows debe ser positivo")
@@ -23,11 +24,19 @@ def main():
         app.init_db()
         path = Path(temp) / "benchmark.csv"
         columns = ["seller", "sku", "weight_g", "height_cm", "length_cm", "width_cm"]
+        if args.with_category_rules:
+            columns.append("category")
+            with app.connect() as c:
+                for i in range(100):
+                    app.save_rule(c, {"category": f"Categoría sintética {i}", "real_min_kg": "0.1", "real_max_kg": "10", "volume_min_kg": "0.1", "volume_max_kg": "100", "note": "Rangos ficticios solo para benchmark, no son límites comerciales."})
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(columns)
             for i in range(args.rows):
-                writer.writerow([f"DEMO-{i % 100}", f"SYNTH-{i}", 1200, 40, 30, 20])
+                row = [f"DEMO-{i % 100}", f"SYNTH-{i}", 1200, 40, 30, 20]
+                if args.with_category_rules:
+                    row.append(f"Categoría sintética {i % 100}")
+                writer.writerow(row)
         with app.connect() as c:
             c.execute("INSERT INTO uploads VALUES ('bench','Sintético.csv',?,?)", (str(path), app.now()))
             c.execute("INSERT INTO jobs(id,upload_id,filename,status,mapping,created_at) VALUES ('bench','bench','Sintético.csv','queued',?,?)", (json.dumps(dict(zip(columns, columns))), app.now()))
@@ -39,6 +48,7 @@ def main():
             result["persisted"] = c.execute("SELECT COUNT(*) FROM skus").fetchone()[0]
             result["classified_S"] = c.execute("SELECT COUNT(*) FROM skus WHERE json_extract(calculated,'$.size')='S'").fetchone()[0]
         result["seconds"] = round(elapsed, 2)
+        result["category_rules"] = 100 if args.with_category_rules else 0
         start = time.perf_counter()
         summary = app.summary()
         result["summary_seconds"] = round(time.perf_counter() - start, 2)

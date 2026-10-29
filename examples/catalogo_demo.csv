@@ -1,17 +1,17 @@
-﻿seller,sku,name,gtin,brand,model,variant,presentation,packaging,weight_g,height_cm,length_cm,width_cm,reference_verified,source_url,evidence_kind,billed_size
-DEMO · Casa Norte,DEMO-CAF-01,Cafetera Aurora · referencia ficticia,,Aurora Demo,CAF-40,Única,1 unidad,Caja de despacho estándar,1200,40,30,20,true,https://example.com/demo/cafetera-empaque,empaque_envio,
-DEMO · Mercado Centro,DEMO-CAF-02,Cafetera Aurora · largo por revisar,,Aurora Demo,CAF-40,Única,1 unidad,Caja de despacho estándar,1200,100,30,20,,,,
-DEMO · Tecno Sur,DEMO-AUD-01,Audífonos inalámbricos · datos ficticios,,Sonora Demo,A10,Única,1 unidad,Caja de despacho estándar,300,15,12,8,,,,
-DEMO · Casa Norte,DEMO-LAMP-01,Lámpara de escritorio · datos ficticios,,Luz Demo,L20,Única,1 unidad,Caja de despacho estándar,1600,35,20,20,,,,
-DEMO · Mercado Centro,DEMO-LIB-01,Libro ilustrado · datos ficticios,,Editorial Demo,L01,Única,1 unidad,Caja de despacho estándar,800,25,20,3,,,,
-DEMO · Tecno Sur,DEMO-TAB-01,Tableta · peso entre intervalos,,Tecno Demo,T1,Única,1 unidad,Caja de despacho estándar,1050,25,15,1,,,,
-DEMO · Casa Norte,DEMO-SILL-01,Silla compacta · datos ficticios,,Casa Demo,S2,Única,1 unidad,Caja de despacho estándar,8000,60,50,45,,,,
-DEMO · Mercado Centro,DEMO-MESA-01,Mesa plegable · datos ficticios,,Casa Demo,M3,Única,1 unidad,Caja de despacho estándar,12000,120,70,15,,,,
-DEMO · Tecno Sur,DEMO-FALTA-01,Producto con peso faltante · datos ficticios,,Tecno Demo,F1,Única,1 unidad,Caja de despacho estándar,,20,20,20,,,,
-DEMO · Casa Norte,DEMO-REV-01,Producto con volumen extremo · datos ficticios,,Casa Demo,X1,Única,1 unidad,Caja de despacho estándar,100,100,100,100,,,,
-DEMO · Mercado Centro,DEMO-PACK-01,Cafetera Aurora · pack distinto,,Aurora Demo,CAF-40,Única,2 unidades,Caja de despacho estándar,2400,80,30,20,,,,
-DEMO · Tecno Sur,DEMO-PES-01,Carga fuera de tabla · datos ficticios,,Tecno Demo,P1,Única,1 unidad,Caja de despacho estándar,501000,100,100,100,,,,
-DEMO · Casa Norte,DEMO-HER-01,Herramientas · referencia ficticia,,Taller Demo,H60,Única,1 unidad,Caja de despacho estándar,5000,60,40,30,true,https://example.com/demo/herramientas-empaque,empaque_envio,
-DEMO · Mercado Centro,DEMO-HER-02,Herramientas · posible subida de talla,,Taller Demo,H60,Única,1 unidad,Caja de despacho estándar,5000,20,20,20,,,,S
-DEMO · Tecno Sur,DEMO-HER-03,Herramientas · misma referencia de envío,,Taller Demo,H60,Única,1 unidad,Caja de despacho estándar,5000,20,20,20,,,,S
-DEMO · Casa Norte,DEMO-RACK-01,Perfil de rack · largo informativo ficticio,,Taller Demo,R350,Única,1 unidad,Caja de despacho estándar,15000,350,10,10,,,,
+﻿seller,sku,name,gtin,brand,model,variant,presentation,packaging,weight_g,height_cm,length_cm,width_cm,reference_verified,source_url,evidence_kind,billed_size,category,subcategory
+DEMO · Casa Norte,DEMO-CAF-01,Cafetera Aurora · referencia ficticia,,Aurora Demo,CAF-40,Única,1 unidad,Caja de despacho estándar,1200,40,30,20,true,https://example.com/demo/cafetera-empaque,empaque_envio,,DEMO · Hogar,Demostración ficticia
+DEMO · Mercado Centro,DEMO-CAF-02,Cafetera Aurora · largo por revisar,,Aurora Demo,CAF-40,Única,1 unidad,Caja de despacho estándar,1200,100,30,20,,,,,DEMO · Hogar,Demostración ficticia
+DEMO · Tecno Sur,DEMO-AUD-01,Audífonos inalámbricos · datos ficticios,,Sonora Demo,A10,Única,1 unidad,Caja de despacho estándar,300,15,12,8,,,,,DEMO · Tecnología,Demostración ficticia
+DEMO · Casa Norte,DEMO-LAMP-01,Lámpara de escritorio · datos ficticios,,Luz Demo,L20,Única,1 unidad,Caja de despacho estándar,1600,35,20,20,,,,,DEMO · Hogar,Demostración ficticia
+DEMO · Mercado Centro,DEMO-LIB-01,Libro ilustrado · datos ficticios,,Editorial Demo,L01,Única,1 unidad,Caja de despacho estándar,800,25,20,3,,,,,DEMO · Hogar,Demostración ficticia
+DEMO · Tecno Sur,DEMO-TAB-01,Tableta · peso entre intervalos,,Tecno Demo,T1,Única,1 unidad,Caja de despacho estándar,1050,25,15,1,,,,,DEMO · Tecnología,Demostración ficticia
+DEMO · Casa Norte,DEMO-SILL-01,Silla compacta · datos ficticios,,Casa Demo,S2,Única,1 unidad,Caja de despacho estándar,8000,60,50,45,,,,,DEMO · Hogar,Demostración ficticia
+DEMO · Mercado Centro,DEMO-MESA-01,Mesa plegable · datos ficticios,,Casa Demo,M3,Única,1 unidad,Caja de despacho estándar,12000,120,70,15,,,,,DEMO · Hogar,Demostración ficticia
+DEMO · Tecno Sur,DEMO-FALTA-01,Producto con peso faltante · datos ficticios,,Tecno Demo,F1,Única,1 unidad,Caja de despacho estándar,,20,20,20,,,,,DEMO · Tecnología,Demostración ficticia
+DEMO · Casa Norte,DEMO-REV-01,Producto con volumen extremo · datos ficticios,,Casa Demo,X1,Única,1 unidad,Caja de despacho estándar,100,100,100,100,,,,,DEMO · Hogar,Demostración ficticia
+DEMO · Mercado Centro,DEMO-PACK-01,Cafetera Aurora · pack distinto,,Aurora Demo,CAF-40,Única,2 unidades,Caja de despacho estándar,2400,80,30,20,,,,,DEMO · Hogar,Demostración ficticia
+DEMO · Tecno Sur,DEMO-PES-01,Carga fuera de tabla · datos ficticios,,Tecno Demo,P1,Única,1 unidad,Caja de despacho estándar,501000,100,100,100,,,,,DEMO · Tecnología,Demostración ficticia
+DEMO · Casa Norte,DEMO-HER-01,Herramientas · referencia ficticia,,Taller Demo,H60,Única,1 unidad,Caja de despacho estándar,5000,60,40,30,true,https://example.com/demo/herramientas-empaque,empaque_envio,,DEMO · Hogar,Demostración ficticia
+DEMO · Mercado Centro,DEMO-HER-02,Herramientas · posible subida de talla,,Taller Demo,H60,Única,1 unidad,Caja de despacho estándar,5000,20,20,20,,,,S,DEMO · Hogar,Demostración ficticia
+DEMO · Tecno Sur,DEMO-HER-03,Herramientas · misma referencia de envío,,Taller Demo,H60,Única,1 unidad,Caja de despacho estándar,5000,20,20,20,,,,S,DEMO · Tecnología,Demostración ficticia
+DEMO · Casa Norte,DEMO-RACK-01,Perfil de rack · largo informativo ficticio,,Taller Demo,R350,Única,1 unidad,Caja de despacho estándar,15000,350,10,10,,,,,DEMO · Hogar,Demostración ficticia

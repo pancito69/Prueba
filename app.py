@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import sqlite3
+import sys
 import threading
 import uuid
 import zipfile
@@ -23,6 +24,8 @@ from pydantic import BaseModel, Field
 
 from engine import BANDS, ValidationError, calculate, canonical_hash, identity_key, suggest_mapping, trusted_reference, normalize_billed_size, parse_number
 from reporting import diagnostics as diagnostic_report, diagnostic_rows, groups as review_groups, GROUP_KEY_SQL
+from categories import CategoryEngine, init_schema as init_category_schema, list_rules, save_rule, delete_rule
+from research import init_schema as init_research_schema, register_routes as register_research_routes
 
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get("TALLA_DATA_DIR", ROOT / "data"))
@@ -30,7 +33,7 @@ DB = DATA / "talla.sqlite3"
 UPLOADS = DATA / "uploads"
 TASKS: queue.Queue[str | None] = queue.Queue()
 MUTATION = threading.Lock()
-FIELDS = ["seller", "sku", "name", "gtin", "brand", "model", "variant", "presentation", "packaging", "weight_g", "height_cm", "length_cm", "width_cm", "reference_verified", "source_url", "evidence_kind", "billed_size"]
+FIELDS = ["seller", "sku", "name", "gtin", "brand", "model", "variant", "presentation", "packaging", "weight_g", "height_cm", "length_cm", "width_cm", "reference_verified", "source_url", "evidence_kind", "billed_size", "category", "subcategory"]
 MEASURES = ["weight_g", "height_cm", "length_cm", "width_cm"]
 REQUIRED = ["seller", "sku", *MEASURES]
 MAX_UPLOAD = 512 * 1024 * 1024
@@ -75,6 +78,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_proposals_reference ON proposals(reference_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_one_pending ON proposals(sku_id) WHERE state='pending';
         CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, sku_id INTEGER NOT NULL REFERENCES skus(id), action TEXT, detail TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS configuration_events (id INTEGER PRIMARY KEY, action TEXT, detail TEXT, created_at TEXT);
         """)
         if "reference_revoked" not in {row["name"] for row in c.execute("PRAGMA table_info(skus)")}:
             c.execute("ALTER TABLE skus ADD COLUMN reference_revoked INTEGER DEFAULT 0")
@@ -83,11 +87,13 @@ def init_db():
             if name not in columns:
                 c.execute(f"ALTER TABLE settings ADD COLUMN {name} {definition}")
         c.execute("UPDATE jobs SET status='failed',error='Proceso interrumpido. Puede volver a procesar el archivo; los registros ya cargados se conservan.',finished_at=? WHERE status IN ('queued','running')", (now(),))
+        init_category_schema(c)
+        init_research_schema(c)
         c.commit()
-        if get_settings(c)["engine_revision"] < 2:
+        if get_settings(c)["engine_revision"] < 3:
             # Preserve a recoverable pre-migration copy before touching existing rows.
             if c.execute("SELECT 1 FROM skus LIMIT 1").fetchone():
-                backup_path = DATA / "talla.pre-v2.sqlite3"
+                backup_path = DATA / "talla.pre-v3.sqlite3"
                 if not backup_path.exists():
                     with sqlite3.connect(backup_path) as backup:
                         c.backup(backup)
@@ -102,6 +108,7 @@ def get_settings(c):
 def upgrade_engine(c):
     """Re-evaluate heuristics without discarding original data or decisions."""
     config = get_settings(c)
+    category_engine = CategoryEngine.from_db(c)
     last_id = 0
     while True:
         rows = c.execute("SELECT * FROM skus WHERE id>? ORDER BY id LIMIT 1000", (last_id,)).fetchall()
@@ -113,16 +120,16 @@ def upgrade_engine(c):
             if digest != row["raw_hash"]:
                 c.execute("UPDATE proposals SET base_hash=? WHERE sku_id=? AND base_hash=?", (digest, row["id"], row["raw_hash"]))
                 c.execute("UPDATE proposals SET reference_hash=? WHERE reference_id=? AND reference_hash=?", (digest, row["id"], row["raw_hash"]))
-            calc = calculate_record(raw, config["rule_mode"], config["volume_ratio_threshold"])
+            calc = calculate_record(raw, config["rule_mode"], config["volume_ratio_threshold"], category_engine)
             live = c.execute("SELECT state FROM proposals WHERE sku_id=? AND state IN ('pending','approved') ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
             status = ("approved" if live["state"] == "approved" else "review") if live else calc["status"]
-            c.execute("UPDATE skus SET raw_hash=?,calculated=?,status=?,is_reference=? WHERE id=?", (digest, json.dumps(calc), status, int(trusted_reference(raw) and not row["reference_revoked"] and calc["status"] == "valid"), row["id"]))
+            c.execute("UPDATE skus SET raw_hash=?,calculated=?,status=?,is_reference=? WHERE id=?", (digest, json.dumps(calc), status, int(trusted_reference(raw) and not row["reference_revoked"] and calc["core_status"] == "valid"), row["id"]))
         last_id = rows[-1]["id"]
-    for p in c.execute("SELECT id,values_json FROM proposals"):
+    for p in c.execute("SELECT p.id,p.values_json,s.raw_json FROM proposals p JOIN skus s ON s.id=p.sku_id"):
         values = json.loads(p["values_json"])
-        calc = calculate_record(values, config["rule_mode"], config["volume_ratio_threshold"])
+        calc = calculate_record({**json.loads(p["raw_json"]), **values}, config["rule_mode"], config["volume_ratio_threshold"], category_engine)
         c.execute("UPDATE proposals SET candidate_hash=?,calculated=? WHERE id=?", (canonical_hash(values), json.dumps(calc), p["id"]))
-    c.execute("UPDATE settings SET engine_revision=2 WHERE id=1")
+    c.execute("UPDATE settings SET engine_revision=3 WHERE id=1")
     generate_proposals(c, config)
 
 
@@ -251,7 +258,7 @@ def validate_headers(values):
     return headers
 
 
-def calculate_record(raw, mode, volume_ratio_threshold="100"):
+def calculate_record(raw, mode, volume_ratio_threshold="100", category_engine=None):
     try:
         calc = calculate(*(raw.get(k, "") for k in MEASURES), rule_mode=mode, volume_ratio_threshold=volume_ratio_threshold)
     except (ValidationError, ValueError) as e:
@@ -266,7 +273,8 @@ def calculate_record(raw, mode, volume_ratio_threshold="100"):
             calc["flags"].append(f"La talla de cobro declarada ({billed}) difiere del cálculo del catálogo ({calc['size']}). Contrastar medidas antes de cambiar el cobro.")
         if calc["reason_codes"] and calc["status"] == "valid":
             calc["status"] = "review"
-    return calc
+    calc["core_status"] = calc["status"]
+    return category_engine.apply(raw, calc) if category_engine is not None else calc
 
 
 def metrics_key(raw):
@@ -296,6 +304,7 @@ def process_job(job_id):
         job_update(c, job_id, status="running", stage="Leyendo y validando catálogo")
         try:
             config = get_settings(c)
+            category_engine = CategoryEngine.from_db(c)
             mapping = json.loads(job["mapping"])
             iterator = read_rows(job["path"])
             next(iterator)
@@ -321,8 +330,8 @@ def process_job(job_id):
                     if previous and previous["raw_hash"] == digest:
                         counters["unchanged"] += 1
                     else:
-                        calc = calculate_record(raw, config["rule_mode"], config["volume_ratio_threshold"])
-                        trusted = int(trusted_reference(raw) and calc["status"] == "valid")
+                        calc = calculate_record(raw, config["rule_mode"], config["volume_ratio_threshold"], category_engine)
+                        trusted = int(trusted_reference(raw) and calc["core_status"] == "valid")
                         values = (raw.get("name", ""), identity_key(raw), json.dumps(raw, ensure_ascii=False), digest, metrics_key(raw), json.dumps(calc), calc["status"], trusted, job_id, now())
                         if previous:
                             c.execute("UPDATE skus SET name=?,identity_key=?,raw_json=?,raw_hash=?,metrics_key=?,calculated=?,status=?,is_reference=?,job_id=?,updated_at=?,reference_revoked=0 WHERE id=?", (*values, previous["id"]))
@@ -351,7 +360,9 @@ def process_job(job_id):
 
 def generate_proposals(c, config):
     invalidate_references(c)
+    category_engine = CategoryEngine.from_db(c)
     # References that disagree are explicitly withheld, regardless of majority.
+    c.execute("DROP TABLE IF EXISTS temp.consensus")
     c.execute("""CREATE TEMP TABLE consensus AS SELECT identity_key,MIN(id) AS reference_id FROM skus
       WHERE is_reference=1 AND identity_key IS NOT NULL GROUP BY identity_key HAVING COUNT(DISTINCT metrics_key)=1""")
     c.execute("CREATE INDEX temp.idx_consensus ON consensus(identity_key)")
@@ -362,7 +373,7 @@ def generate_proposals(c, config):
     for row in c.execute(query):
         reference = json.loads(row["ref_json"])
         values = {key: reference[key] for key in MEASURES}
-        calc = calculate_record(values, config["rule_mode"], config["volume_ratio_threshold"])
+        calc = calculate_record({**json.loads(row["raw_json"]), **values}, config["rule_mode"], config["volume_ratio_threshold"], category_engine)
         if calc["size"] is None:
             continue
         candidate = canonical_hash(values)
@@ -429,6 +440,82 @@ def settings():
     return {**result, "bands": BANDS, "formula": "máximo(peso_gr / 1000, alto_cm × largo_cm × ancho_cm / 5000)"}
 
 
+def recalculate_category_checks(c):
+    """Refresh plausibility only; measured corrections and approvals survive."""
+    config = get_settings(c)
+    category_engine = CategoryEngine.from_db(c)
+    last = 0
+    count = 0
+    while True:
+        rows = c.execute("SELECT * FROM skus WHERE id>? ORDER BY id LIMIT 1000", (last,)).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            raw = json.loads(row["raw_json"])
+            calc = calculate_record(raw, config["rule_mode"], config["volume_ratio_threshold"], category_engine)
+            live = c.execute("SELECT state FROM proposals WHERE sku_id=? AND state IN ('pending','approved') ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
+            status = ("review" if live["state"] == "pending" else "approved") if live else calc["status"]
+            c.execute("UPDATE skus SET calculated=?,status=? WHERE id=?", (json.dumps(calc), status, row["id"]))
+            count += 1
+        last = rows[-1]["id"]
+    for row in c.execute("SELECT p.id,p.values_json,s.raw_json FROM proposals p JOIN skus s ON s.id=p.sku_id WHERE p.state IN ('pending','approved')"):
+        raw = {**json.loads(row["raw_json"]), **json.loads(row["values_json"])}
+        calc = calculate_record(raw, config["rule_mode"], config["volume_ratio_threshold"], category_engine)
+        c.execute("UPDATE proposals SET calculated=? WHERE id=?", (json.dumps(calc), row["id"]))
+    return count
+
+
+@app.get("/api/categories")
+def categories():
+    with connect() as c:
+        rows = c.execute("""SELECT COALESCE(json_extract(raw_json,'$.category'),'') category,
+          COALESCE(json_extract(raw_json,'$.subcategory'),'') subcategory,COUNT(*) count FROM skus
+          GROUP BY category,subcategory ORDER BY count DESC LIMIT 1001""").fetchall()
+        return {"items": [dict(r) for r in rows[:1000]], "truncated": len(rows) > 1000}
+
+
+@app.get("/api/category-rules")
+def category_rules():
+    with connect() as c:
+        return {"items": list_rules(c)}
+
+
+def write_category_rule(body, rule_id=None):
+    with mutating(), connect() as c:
+        previous = next((r for r in list_rules(c) if r["id"] == rule_id), None)
+        if rule_id is not None and previous is None:
+            raise HTTPException(404, "Regla no encontrada.")
+        try:
+            result = save_rule(c, body, rule_id)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        c.execute("INSERT INTO configuration_events(action,detail,created_at) VALUES (?,?,?)", ("category_rule_saved", json.dumps({"previous": previous, "current": result}, ensure_ascii=False), now()))
+        count = recalculate_category_checks(c)
+        return {**result, "recalculated": count}
+
+
+@app.post("/api/category-rules")
+def create_category_rule(body: dict):
+    return write_category_rule(body)
+
+
+@app.put("/api/category-rules/{rule_id}")
+def update_category_rule(rule_id: int, body: dict):
+    return write_category_rule(body, rule_id)
+
+
+@app.delete("/api/category-rules/{rule_id}")
+def disable_category_rule(rule_id: int):
+    with mutating(), connect() as c:
+        previous = next((r for r in list_rules(c) if r["id"] == rule_id), None)
+        if previous is None:
+            raise HTTPException(404, "Regla no encontrada.")
+        delete_rule(c, rule_id)
+        c.execute("INSERT INTO configuration_events(action,detail,created_at) VALUES (?,?,?)", ("category_rule_disabled", json.dumps(previous, ensure_ascii=False), now()))
+        count = recalculate_category_checks(c)
+        return {"disabled": True, "id": rule_id, "recalculated": count}
+
+
 class RuleUpdate(BaseModel):
     rule_mode: str
     volume_ratio_threshold: str | float | int | None = None
@@ -450,10 +537,11 @@ def change_settings(body: RuleUpdate):
             return settings()
         c.execute("UPDATE settings SET rule_mode=?,volume_ratio_threshold=?,version=version+1 WHERE id=1", (body.rule_mode, str(threshold)))
         c.execute("UPDATE proposals SET state='stale' WHERE state IN ('pending','approved')")
+        category_engine = CategoryEngine.from_db(c)
         for row in c.execute("SELECT id,raw_json,is_reference,reference_revoked FROM skus"):
             raw = json.loads(row["raw_json"])
-            calc = calculate_record(raw, body.rule_mode, str(threshold))
-            c.execute("UPDATE skus SET calculated=?,status=?,is_reference=? WHERE id=?", (json.dumps(calc), calc["status"], int(trusted_reference(raw) and not row["reference_revoked"] and calc["status"] == "valid"), row["id"]))
+            calc = calculate_record(raw, body.rule_mode, str(threshold), category_engine)
+            c.execute("UPDATE skus SET calculated=?,status=?,is_reference=? WHERE id=?", (json.dumps(calc), calc["status"], int(trusted_reference(raw) and not row["reference_revoked"] and calc["core_status"] == "valid"), row["id"]))
             audit(c, row["id"], "rules_changed", f"Política {body.rule_mode}; umbral volumétrico/real {threshold}. Las propuestas anteriores quedan obsoletas.")
         generate_proposals(c, get_settings(c))
     return settings()
@@ -498,7 +586,7 @@ def skus(page: int = 1, page_size: int = 25, search: str = "", status: str = "al
         clauses.append("direction=?")
         args.append(direction)
     if reason != "all":
-        if reason not in {"invalid_physical_data", "table_gap", "above_table", "volume_weight_ratio", "proposal_waiting", "billed_size_invalid", "billed_size_mismatch"}:
+        if reason not in {"invalid_physical_data", "table_gap", "above_table", "volume_weight_ratio", "proposal_waiting", "billed_size_invalid", "billed_size_mismatch", "category_real_below_min", "category_real_above_max", "category_volume_below_min", "category_volume_above_max"}:
             raise HTTPException(422, "Motivo inválido.")
         clauses.append("EXISTS(SELECT 1 FROM json_each(sku_analysis.reason_codes) WHERE value=?)")
         args.append(reason)
@@ -555,6 +643,34 @@ class ProposalInput(BaseModel):
     reason: str = Field(min_length=5, max_length=2000)
 
 
+def create_evidence_proposal(c, sku_row, values, source_url, source_kind, evidence_note, reason):
+    """Stage researched values without replacing originals or human decisions."""
+    if set(values) != set(MEASURES):
+        raise ValueError("La evidencia debe aportar los cuatro campos físicos; los faltantes no se completan con el catálogo.")
+    if not valid_url(source_url) or len(source_url) > 2000 or not 15 <= len(evidence_note) <= 40000:
+        raise ValueError("La fuente o la evidencia de la propuesta no es válida.")
+    current = c.execute("SELECT * FROM skus WHERE id=?", (sku_row["id"],)).fetchone()
+    if current is None or current["raw_hash"] != sku_row["raw_hash"]:
+        raise ValueError("El registro cambió desde la investigación.")
+    config = get_settings(c)
+    converted = {field: str(values[field]) for field in MEASURES}
+    raw = {**json.loads(current["raw_json"]), **converted}
+    calc = calculate_record(raw, config["rule_mode"], config["volume_ratio_threshold"], CategoryEngine.from_db(c))
+    if calc["size"] is None:
+        raise ValueError("Las medidas encontradas no permiten asignar una talla con las reglas actuales.")
+    digest = canonical_hash(converted)
+    previous = c.execute("""SELECT id,state FROM proposals WHERE sku_id=? AND base_hash=? AND rule_version=?
+      AND (candidate_hash=? OR state IN ('pending','approved'))
+      AND state IN ('pending','approved','rejected') ORDER BY id DESC LIMIT 1""", (current["id"], current["raw_hash"], config["version"], digest)).fetchone()
+    if previous:
+        return {"id": previous["id"], "state": previous["state"], "created": False}
+    cur = c.execute("""INSERT INTO proposals(sku_id,base_hash,candidate_hash,rule_version,values_json,calculated,
+      source_url,source_kind,evidence_note,reason,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (current["id"], current["raw_hash"], digest, config["version"], json.dumps(converted), json.dumps(calc), source_url, source_kind, evidence_note, reason, "pending", now()))
+    c.execute("UPDATE skus SET status='review' WHERE id=?", (current["id"],))
+    audit(c, current["id"], "research_proposal_created", reason)
+    return {"id": cur.lastrowid, "state": "pending", "created": True}
+
+
 def valid_url(url):
     try:
         p = urlparse(url)
@@ -567,7 +683,7 @@ def valid_url(url):
 def propose(sku_id: int, body: ProposalInput):
     if not valid_url(body.source_url):
         raise HTTPException(422, "Indique una URL http(s) de evidencia sin credenciales.")
-    if body.source_kind not in {"medicion_logistica", "fabricante", "tienda_oficial", "otro_seller"}:
+    if body.source_kind not in {"medicion_logistica", "fabricante", "tienda_oficial", "otro_seller", "investigacion_externa"}:
         raise HTTPException(422, "Tipo de fuente inválido.")
     with mutating(), connect() as c:
         row = c.execute("SELECT * FROM skus WHERE id=?", (sku_id,)).fetchone()
@@ -576,7 +692,7 @@ def propose(sku_id: int, body: ProposalInput):
         values = {key: str(getattr(body, key)) for key in MEASURES}
         config = get_settings(c)
         try:
-            calc = calculate(*(values[k] for k in MEASURES), rule_mode=config["rule_mode"], volume_ratio_threshold=config["volume_ratio_threshold"])
+            calc = calculate_record({**json.loads(row["raw_json"]), **values}, config["rule_mode"], config["volume_ratio_threshold"], CategoryEngine.from_db(c))
         except ValueError as e:
             raise HTTPException(422, str(e))
         if calc["size"] is None:
@@ -839,3 +955,4 @@ def index():
 
 
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
+register_research_routes(app, sys.modules[__name__])

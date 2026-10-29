@@ -2,7 +2,7 @@
 
 ## Comprobado
 
-- **34 pruebas automatizadas aprobadas** con `unittest`: cálculo en gramos/cm,
+- **59 pruebas automatizadas aprobadas** con `unittest`: cálculo en gramos/cm,
   divisor 5000, cada límite de talla, huecos, entradas inválidas, conservación de
   precisión decimal, CSV/XLSX, cargas idénticas, duplicados, confianza explícita,
   coincidencia de presentación/empaque, fuentes contradictorias, propuestas,
@@ -11,6 +11,11 @@
   cobro declarado sin equivalencias supuestas, precisión, umbral configurable,
   observación de longitud, decisiones agrupadas atómicas y migración real desde
   un esquema v1 preservando originales, aprobaciones y exportación.
+  La versión 3 añade reglas por categoría sin imputación, subcategoría/presentación,
+  deshabilitado versionado, migración v2 auténtica, investigación por producto,
+  evidencia por campo, conversión de unidades, mínimos no exportables, abstención,
+  contradicciones históricas, reimportaciones, snapshots obsoletos y reintentos
+  auditados que respetan aprobaciones y rechazos previos.
 - Navegador Chromium: demo, importación CSV con mapeo, propuesta manual,
   aprobación M → S, descarga CSV, reimportación sin duplicados, reglas y vista
   móvil de 390 px. Sin errores JavaScript observados.
@@ -18,13 +23,18 @@
   aprobación de 2 propuestas con evidencia compartida, cambio de umbral que
   invalida aprobaciones, rack de 350 cm con observación sin error automático y
   mapeo de talla de cobro actual sin confundirla con la clase anterior del Excel.
+  En v3: carga con categorías, regla manual, exportación de casos/instrucciones,
+  importación completa y parcial, revisión humana del mínimo, texto CSV pegado,
+  acumulación de campos posteriores y conservación de aprobaciones al editar
+  una regla de plausibilidad. Las capturas contienen datos ficticios.
 - Instancia limpia iniciada: interfaz, JavaScript, API de salud y resumen
   respondieron HTTP 200. El catálogo operativo se dejó vacío.
 - Carga sintética aislada mediante `python scripts/benchmark.py --rows 400000`:
   **400.000 procesados, 400.000 persistidos, 400.000 clasificados S, 0 errores**.
-  Tiempo medido de importación/cálculo en v2: **26,79 segundos** en esta máquina.
-  Consultas posteriores sobre esa base sintética: resumen **1,55 s**, diagnóstico
-  **1,98 s** y primera página **1,81 s**. Son mediciones locales, sin investigación
+  En v3 se evaluaron **100 reglas ficticias de categoría** durante la carga.
+  Tiempo medido de importación/cálculo: **37,22 segundos** en esta máquina.
+  Consultas posteriores sobre esa base sintética: resumen **3,58 s**, diagnóstico
+  **4,48 s** y primera página **3,03 s**. Son mediciones locales, sin investigación
   de fuentes ni uso de IA externa.
 
 ## Límites de esa evidencia
@@ -40,5 +50,8 @@ todavía requiere validación de estructura y memoria.
 
 El iniciador ofrece el mismo arranque documentado en un entorno virtual local;
 la interfaz y API se probaron en Linux. El lanzador `.bat` no se ejecutó en Windows.
-No se conectaron IA, sistemas de catálogo externos ni facturación. No hay
+No se conectaron proveedores de IA, sistemas de catálogo externos ni facturación.
+El flujo de investigación exporta archivos para uso manual en un chat; importa
+declaraciones de evidencia, no certifica la existencia o veracidad de las fuentes.
+No hay
 autenticación ni roles: es un piloto para evaluación local.

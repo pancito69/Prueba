@@ -189,6 +189,8 @@ _ALIASES = {
     "source_url": {"sourceurl", "fuenteurl", "urlfuente", "fuente", "enlacefuente"},
     "evidence_kind": {"evidencekind", "tipomedida", "tipoevidencia", "tipodemedida"},
     "billed_size": {"billedsize", "tallacobroactual", "talladecobroactual"},
+    "category": {"category", "categoria", "categoriaproducto", "categoriaarticulo"},
+    "subcategory": {"subcategory", "subcategoria", "subcategoriaproducto", "subcategoriaarticulo"},
 }
 
 
@@ -260,7 +262,7 @@ def identity_key(record: dict) -> str | None:
 _SOURCE_FIELDS = (
     "seller", "sku", "name", "gtin", "brand", "model", "variant", "presentation",
     "packaging", "weight_g", "height_cm", "length_cm", "width_cm",
-    "reference_verified", "source_url", "evidence_kind", "billed_size",
+    "reference_verified", "source_url", "evidence_kind", "billed_size", "category", "subcategory",
 )
 _NUMBER_FIELDS = {"weight_g", "height_cm", "length_cm", "width_cm"}
 

@@ -3,6 +3,91 @@
 Piloto funcional para cargar un catálogo, calcular tallas, detectar diferencias,
 registrar evidencia, aprobar correcciones y exportarlas. Interfaz en español.
 
+## Versión 3: categorías e investigación sin API de pago
+
+La aplicación no inicia sesión en ChatGPT/Claude, no envía consultas a proveedores
+ni descarga páginas. Exporta un lote y sus instrucciones para que tú los uses
+en una cuenta de chat con las herramientas disponibles en tu plan. Puedes importar
+el CSV resultante o pegar su texto. Esa investigación está sujeta a los límites
+de tu cuenta; la aplicación no genera consumo de API.
+
+### Recorrido de trabajo
+
+1. **Carga las categorías.** En el mapeo del catálogo asigna `category` y, si existe,
+   `subcategory`. Si el catálogo cargado antes no contenía esos campos, vuelve a
+   importar asignando sus columnas. No se deducen desde el nombre del producto.
+2. **Define reglas en Categorías.** Introduce mínimos/máximos de peso real y
+   volumétrico en **kg**, junto con su justificación. Puedes limitar el alcance a
+   una subcategoría y presentación. Campos de alcance vacíos abarcan todas sus
+   variantes explícitamente. Prevalece la regla más específica.
+3. **Consulta Diagnóstico.** Los valores bajos/altos son candidatos: una regla no
+   sustituye medidas, no asigna el promedio y no certifica qué valor es correcto.
+   Las reglas comienzan vacías porque no se inventaron límites comerciales.
+4. **Abre Investigar sin API.** Crea un lote, inicialmente de 20 productos. Se
+   priorizan posibles subidas y se agrupan identidades compatibles. Los productos
+   sin identidad suficiente se mantienen individuales. Una investigación puede
+   servir para varios SKUs del mismo producto, presentación y paquete.
+5. **Descarga Casos CSV e Instrucciones.** Adjunta ambos a ChatGPT o Claude con
+   navegación habilitada según tu cuenta. Pide seguir el documento. Si no puede
+   consultar fuentes, debe devolver `insufficient`; nunca rellenar por intuición.
+6. **Importa o pega el resultado.** Una fila por campo y fuente. La herramienta
+   controla IDs, unidades, medidas positivas, URL, cita, identidad/empaque
+   declarados y contradicciones. Los datos del producto o peso neto no se aceptan
+   como medidas del paquete de envío.
+7. **Comprueba la evidencia.** Cada campo conserva su fuente y cita. Un enlace y
+   una cita escritos por un asistente pueden ser incorrectos o inventados: la app
+   no los ha consultado y no garantiza cero alucinaciones. Comprueba que existan
+   y respalden el valor, producto, presentación y paquete antes de aprobar.
+8. **Aprueba por grupos.** Cuatro medidas respaldadas generan propuestas pendientes
+   para los miembros vigentes; no reemplazan el catálogo original. La aprobación
+   y exportación se realizan en la bandeja habitual, con auditoría individual.
+
+### Evidencia parcial y reintentos
+
+- Un peso del paquete conocido permite un **límite inferior** del peso aplicable.
+  Lo mismo ocurre con tres dimensiones de paquete que permitan calcular volumen.
+  Se muestra "al menos talla X" cuando la tabla lo permite: **no es talla exacta**.
+- Una subida mínima compara únicamente el SKU representante vigente indicado en
+  pantalla. No se presupone que todos los sellers del grupo tengan igual talla
+  anterior. Confirmar su evidencia no lo incluye en el CSV de correcciones.
+- Puedes aportar después más campos al mismo caso parcial. El sistema compara el
+  historial completo: dos valores distintos para un campo producen conflicto,
+  sin elegir una fuente ni sustituir el dato anterior.
+- Reinvestigar crea otro lote enlazado, exige motivo y adjunta las fuentes previas
+  para resolver sus contradicciones. No se borran importaciones ni rechazos. Si
+  quedan propuestas pendientes/aprobadas, deben resolverse por su flujo habitual.
+- Resultados de otro lote, registros cambiados, reglas de talla cambiadas o
+  decisiones posteriores no reemplazan trabajo vigente. Una carga idéntica de
+  resultados no duplica propuestas.
+
+### Formato de respuesta para el asistente
+
+El botón **Plantilla de resultados** descarga estos encabezados exactos:
+
+```csv
+case_id,status,field,value,unit,measurement_type,source_url,quote,source_title,identity_confirmed,packaging_confirmed
+```
+
+`status`: `found`, `insufficient` o `conflict`. Campos físicos: `weight_g`,
+`height_cm`, `length_cm`, `width_cm`. Peso admite `g` o `kg`; dimensiones `cm`,
+`mm` o `m`. La conversión es decimal exacta. Solo `shipping_package` con fuente,
+cita y declaraciones de identidad/empaque completas es elegible para propuesta.
+Estas declaraciones del archivo **no son aprobación humana**.
+
+El original CSV, las filas y sus fuentes se guardan localmente para auditoría.
+Los campos desconocidos siguen vacíos. No se completan con los valores anteriores
+del catálogo para aparentar una investigación completa.
+
+### Actualización desde versiones anteriores
+
+Detén la aplicación, respalda `data/`, descarga el código completo de esta rama y
+conserva `data/` y `.venv/` al reemplazarlo. Inicia de nuevo con `iniciar.bat` o
+`python iniciar.py`. La migración v3 crea una copia `data/talla.pre-v3.sqlite3`
+si había catálogo; conserva originales y aprobaciones válidas. Esta copia y los
+archivos de investigación contienen información comercial: consérvalos localmente.
+La primera apertura puede tardar al actualizar una base grande. Para usar categorías
+ausentes en la importación anterior, vuelve a mapearlas al cargar el archivo.
+
 ## Versión 2: diagnóstico, prioridad y revisión por grupos
 
 - **Diagnóstico** desglosa casos por motivo, exporta el detalle y separa el cálculo
@@ -217,6 +302,7 @@ invalidación. Para generar y ejecutar una carga sintética aislada:
 
 ```bash
 python scripts/benchmark.py --rows 400000
+python scripts/benchmark.py --rows 400000 --with-category-rules
 ```
 
 El benchmark usa datos ficticios y un directorio temporal, no el catálogo operativo.

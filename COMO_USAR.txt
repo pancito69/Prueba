@@ -1,5 +1,22 @@
 TALLA · CONTROL LOGÍSTICO — PILOTO
 
+NUEVO EN VERSIÓN 3: INVESTIGACIÓN SIN API DE PAGO
+1. Al cargar tu catálogo, asigna Categoría y Subcategoría si están disponibles.
+2. En Categorías registra rangos en kg con su justificación. No hay límites
+   comerciales inventados: debes definirlos con referencias o criterio operativo.
+3. Consulta Diagnóstico y crea un lote en «Investigar sin API».
+4. Descarga Casos CSV e Instrucciones y adjúntalos a ChatGPT/Claude con navegación.
+5. Pide que devuelva el CSV indicado. Debe abstenerse si no encuentra evidencia.
+6. Importa el CSV o pega su texto en la herramienta.
+7. Comprueba fuentes y citas; el asistente también puede equivocarse o inventarlas.
+8. Revisa y aprueba las propuestas completas por grupos.
+
+Los resultados parciales muestran una talla mínima propuesta y sus límites;
+no se exportan como una talla exacta. Se puede añadir evidencia después.
+Reinvestigar exige motivo y conserva el historial previo.
+La herramienta no se conecta a tu cuenta ni genera consultas a una API.
+Tus límites de mensajes, archivos y navegación dependen del servicio que uses.
+
 1. Descomprime el ZIP en una carpeta de tu equipo.
 2. Instala Python 3.12 si todavía no lo tienes.
 3. Windows: abre iniciar.bat con doble clic.

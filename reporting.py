@@ -18,6 +18,10 @@ REASON_LABELS = {
     "proposal_waiting": "Propuesta con evidencia pendiente de aprobación",
     "billed_size_invalid": "Talla de cobro declarada no reconocida",
     "billed_size_mismatch": "Talla declarada distinta de la calculada; requiere contrastar datos",
+    "category_real_below_min": "Peso real por debajo del mínimo declarado para su categoría",
+    "category_real_above_max": "Peso real por encima del máximo declarado para su categoría",
+    "category_volume_below_min": "Peso volumétrico por debajo del mínimo declarado para su categoría",
+    "category_volume_above_max": "Peso volumétrico por encima del máximo declarado para su categoría",
 }
 
 DIRECTIONS = ("up", "down", "same", "unknown")
@@ -113,13 +117,13 @@ def diagnostic_rows(c, scope="attention"):
     if scope not in {"attention", "all"}:
         raise ValueError("El alcance del diagnóstico debe ser attention o all.")
     yield [
-        "ID", "Seller", "SKU", "Producto", "Marca", "Modelo", "GTIN", "Variante",
+        "ID", "Seller", "SKU", "Producto", "Categoria", "Subcategoria", "Marca", "Modelo", "GTIN", "Variante",
         "Presentacion", "Empaque", "Peso (gr)", "Alto (cm)", "Largo (cm)", "Ancho (cm)",
         "Peso real (kg)", "Peso volumetrico (kg)", "Peso clasificacion (kg)",
         "Talla calculada con datos originales", "Estado", "Codigos de motivo", "Motivos",
         "Alertas", "Observaciones", "Talla de cobro declarada", "Talla comparada desde",
         "Talla comparada hasta", "Direccion", "Base de comparacion", "Estado de evidencia",
-        "Identidad declarada", "Propuesta ID", "Estado de propuesta", "Fuente", "Evidencia",
+        "Identidad declarada", "Propuesta ID", "Estado de propuesta", "Fuente", "Evidencia", "Regla de categoria", "Resultado de categoria",
     ]
     where = " WHERE s.status IN ('review','pending')" if scope == "attention" else ""
     query = """SELECT s.*,p.source_url AS proposal_source_url,p.evidence_note AS proposal_evidence_note
@@ -129,7 +133,7 @@ def diagnostic_rows(c, scope="attention"):
         calc = _document(row["calculated"], {})
         codes = _document(row["reason_codes"], [])
         yield [
-            row["id"], row["seller"], row["sku"], row["name"],
+            row["id"], row["seller"], row["sku"], row["name"], raw.get("category", ""), raw.get("subcategory", ""),
             raw.get("brand", ""), raw.get("model", ""), raw.get("gtin", ""),
             raw.get("variant", ""), raw.get("presentation", ""), raw.get("packaging", ""),
             *(raw.get(key, "") for key in ("weight_g", "height_cm", "length_cm", "width_cm")),
@@ -142,6 +146,7 @@ def diagnostic_rows(c, scope="attention"):
             row["analysis_proposal_id"], row["analysis_proposal_state"],
             row["proposal_source_url"] or raw.get("source_url", ""),
             row["proposal_evidence_note"] or "",
+            calc.get("category_check", {}).get("rule_id", ""), calc.get("category_check", {}).get("status", ""),
         ]
 
 
