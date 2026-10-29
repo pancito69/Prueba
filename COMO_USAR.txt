@@ -13,6 +13,17 @@ TALLA · CONTROL LOGÍSTICO — PILOTO
    Aprueba solo las correcciones que correspondan al mismo producto y empaque.
 8. Usa «Exportar aprobados» para obtener el archivo de cambios.
 
+NUEVO EN VERSIÓN 2
+- «Diagnóstico»: motivos, exportación, evidencia e identidad disponible.
+- Filtro «Sube de talla»: prioridad de revisión, no confirma subcobro.
+- «Revisiones → Por grupo»: seleccionar y aprobar propuestas con evidencia común.
+- Longitud mayor a 300 cm es informativa; comprueba el paquete de despacho.
+- «Reglas»: umbral volumétrico/real configurable; alertas no prueban errores.
+- Talla de cobro actual es opcional y usa la tabla de cooperados, no la clase vieja.
+
+PARA ACTUALIZAR: cierra la versión anterior, respalda data/, reemplaza los archivos
+de código conservando data/ y .venv/, y vuelve a iniciar. Lee README.md para detalle.
+
 El catálogo real adjuntado en la conversación NO fue procesado.
 La herramienta no aplica cambios a tu sistema de origen ni modifica cobros.
 La búsqueda automática con IA no está conectada; se registra evidencia obtenida

@@ -76,15 +76,21 @@ def _text(number: Decimal) -> str:
     return "0" if text in {"-0", ""} else text
 
 
-def calculate(weight_g, height_cm, length_cm, width_cm, rule_mode="strict") -> dict:
+def calculate(weight_g, height_cm, length_cm, width_cm, rule_mode="strict", *,
+              volume_ratio_threshold="100") -> dict:
     """Calculate shipping weight and size without rounding boundary decisions.
 
     Invalid physical input raises ValidationError. Valid measurements that land
     in a gap or exceed 500 kg return ``pending`` with no invented size. Review
     flags are alerts only and never authorize changing the source measurements.
+    The volume/real ratio threshold is configurable independently of the table.
+    A long dimension is an informational observation, not proof of bad data.
     """
     if rule_mode not in {"strict", "upper_bounds"}:
         raise ValidationError("La política de tallas no es válida.")
+    threshold = parse_number(volume_ratio_threshold, "Umbral de relación volumétrico/real")
+    if not Decimal(1) <= threshold <= Decimal(1000000):
+        raise ValidationError("El umbral volumétrico/real debe estar entre 1 y 1.000.000.")
     fields = {
         "weight_g": (weight_g, "Peso real (gr)"),
         "height_cm": (height_cm, "Alto (cm)"),
@@ -100,7 +106,7 @@ def calculate(weight_g, height_cm, length_cm, width_cm, rule_mode="strict") -> d
     # Products and /5000 have finite decimal expansions. Choose enough precision
     # for all digits/exponents so Decimal's ambient context cannot round a band.
     precision = max(50, sum(len(n.as_tuple().digits) + abs(n.as_tuple().exponent)
-                            for n in numbers.values()) + 20)
+                            for n in [*numbers.values(), threshold]) + 20)
     with localcontext() as context:
         context.prec = precision
         real = numbers["weight_g"] / Decimal(1000)
@@ -115,18 +121,28 @@ def calculate(weight_g, height_cm, length_cm, width_cm, rule_mode="strict") -> d
                 size = band["size"]
                 break
         flags = []
+        reason_codes = []
+        observations = []
+        observation_codes = []
         if size is None:
+            reason_codes.append("above_table" if charge > Decimal(500) else "table_gap")
             flags.append(
                 "Peso superior a 500 kg: requiere una regla de excepción."
                 if charge > Decimal(500)
                 else "Peso en un hueco de la tabla literal: falta definir el criterio de clasificación."
             )
-        if volume >= real * Decimal(100):
+        if volume >= real * threshold:
+            reason_codes.append("volume_weight_ratio")
             flags.append(
-                "El peso volumétrico es al menos 100 veces el real: revisar unidades y empaque."
+                f"El peso volumétrico es al menos {_text(threshold)} veces el real: "
+                "revisar unidades y empaque; esta relación no demuestra un error."
             )
         if any(numbers[key] > Decimal(300) for key in ("height_cm", "length_cm", "width_cm")):
-            flags.append("Alguna dimensión supera 300 cm: verificar el empaque de envío.")
+            observation_codes.append("long_dimension")
+            observations.append(
+                "Alguna dimensión supera 300 cm. Puede ser válida: confirmar que describe "
+                "el paquete despachado y no el producto desplegado."
+            )
         return {
             **{key: _text(number) for key, number in numbers.items()},
             "real_kg": _text(real),
@@ -134,6 +150,9 @@ def calculate(weight_g, height_cm, length_cm, width_cm, rule_mode="strict") -> d
             "charge_kg": _text(charge),
             "size": size,
             "flags": flags,
+            "reason_codes": reason_codes,
+            "observations": observations,
+            "observation_codes": observation_codes,
             "status": "pending" if size is None else ("review" if flags else "valid"),
         }
 
@@ -169,6 +188,7 @@ _ALIASES = {
     "reference_verified": {"referenceverified", "referenciaverificada", "verificado", "fuenteverificada"},
     "source_url": {"sourceurl", "fuenteurl", "urlfuente", "fuente", "enlacefuente"},
     "evidence_kind": {"evidencekind", "tipomedida", "tipoevidencia", "tipodemedida"},
+    "billed_size": {"billedsize", "tallacobroactual", "talladecobroactual"},
 }
 
 
@@ -181,6 +201,16 @@ def suggest_mapping(headers) -> dict:
         if len(candidates) == 1:
             result[canonical] = candidates[0]
     return result
+
+
+def normalize_billed_size(value) -> str | None:
+    """Accept only an explicit size from the charging table, without legacy aliases.
+
+    The optional billed_size input must already use this table's nomenclature;
+    an existing logistics class is never translated or inferred automatically.
+    """
+    text = str(value or "").strip().upper()
+    return text if text in {band["size"] for band in BANDS} else None
 
 
 def _gtin(value) -> str | None:
@@ -230,7 +260,7 @@ def identity_key(record: dict) -> str | None:
 _SOURCE_FIELDS = (
     "seller", "sku", "name", "gtin", "brand", "model", "variant", "presentation",
     "packaging", "weight_g", "height_cm", "length_cm", "width_cm",
-    "reference_verified", "source_url", "evidence_kind",
+    "reference_verified", "source_url", "evidence_kind", "billed_size",
 )
 _NUMBER_FIELDS = {"weight_g", "height_cm", "length_cm", "width_cm"}
 
@@ -247,6 +277,10 @@ def canonical_hash(record: dict) -> str:
                 normalized[field] = str(value or "").strip()
         elif field == "reference_verified":
             normalized[field] = _truth(value)
+        elif field == "billed_size":
+            # Preserve unknown inputs in the hash too: correcting a malformed
+            # billed size must be observed as a real source-data change.
+            normalized[field] = str(value or "").strip().upper()
         else:
             normalized[field] = str(value or "").strip()
     raw = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

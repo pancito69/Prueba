@@ -3,6 +3,68 @@
 Piloto funcional para cargar un catálogo, calcular tallas, detectar diferencias,
 registrar evidencia, aprobar correcciones y exportarlas. Interfaz en español.
 
+## Versión 2: diagnóstico, prioridad y revisión por grupos
+
+- **Diagnóstico** desglosa casos por motivo, exporta el detalle y separa el cálculo
+  del estado de la evidencia. "Calculados sin alertas" no significa medidas
+  verificadas. Una fila puede tener varios motivos: no sumes esos conteos como
+  SKUs únicos. Los grupos de investigación exigen identidad explícita.
+- **Dirección** permite priorizar subidas, bajadas, misma talla o sin base. Con
+  `billed_size` válido se compara la talla de cobro declarada con la propuesta
+  vigente o, si falta, con el cálculo del catálogo. Sin talla declarada, solo una
+  propuesta permite comparar con el cálculo original. Sin ambas bases queda
+  desconocida: no se estima una "talla real" ni una pérdida monetaria.
+- `billed_size` es opcional y debe usar exactamente la tabla de cooperados. No se
+  reconoce como equivalente la columna de clase logística antigua del Excel.
+  Un valor no reconocido genera un motivo explícito; no se adivina su equivalencia.
+- Una dimensión **>300 cm es una observación**, no una alerta de error por sí sola.
+  Cortinas, racks y otros productos pueden ser largos. Siempre verificar las
+  medidas del paquete despachado, no las del producto desplegado. No se infieren
+  excepciones por palabras del título ni se inventan rangos por categoría.
+- La relación volumétrico/real es una **heurística configurable** en Reglas,
+  inicialmente 100. Sirve para investigar, no demuestra que las medidas estén mal.
+  Cambiar su umbral recalcula y deja obsoletas propuestas y aprobaciones anteriores.
+- **Revisiones → Por grupo** reúne propuestas pendientes con igual identidad,
+  evidencia, valores, referencia y comparación. Puedes seleccionar hasta 500 del
+  mismo grupo por decisión. Se conserva auditoría individual; el lote es atómico:
+  una propuesta obsoleta impide aplicar toda esa selección. Los registros sin
+  identidad suficiente siguen individuales. Una alerta sin propuesta no se
+  convierte automáticamente en un grupo aprobable.
+- **IA y costos** informa cuántos productos son identificables y cuántas filas
+  carecen de evidencia. IA externa sigue desconectada: cero consultas del piloto.
+
+### Actualizar conservando tu catálogo
+
+1. Detén la versión anterior con Ctrl+C y haz una copia de la carpeta `data/`.
+2. Descarga el nuevo código de la misma rama y reemplaza los archivos de la
+   aplicación, **conservando `data/` y `.venv/`**. No necesitas volver a importar.
+3. Ejecuta `iniciar.bat` o `python iniciar.py` de nuevo. La primera apertura
+   actualiza los motivos y puede tardar con un catálogo grande. Conserva datos
+   originales, decisiones y hashes equivalentes; crea `data/talla.pre-v2.sqlite3`
+   antes de la migración si había SKUs. Esta copia también contiene datos privados.
+4. Abre Diagnóstico y revisa el desglose de la base actualizada. Los conteos pueden
+   cambiar porque longitud >300 cm ya no obliga por sí sola a revisar.
+
+El diagnóstico del catálogo de 646.396 SKUs ejecutado en tu equipo **no está en
+esta máquina**. Los cambios se validaron con datos ficticios y migraciones de
+prueba; no se afirma haber recalculado ni verificado esas medidas reales.
+
+### Opciones para incorporar IA después
+
+| Opción | Costos y alcance |
+|---|---|
+| Reglas y referencias reutilizadas | Sin consultas a proveedores de IA; usa tu equipo y evidencia disponible. |
+| Investigación asistida con tu cuenta de chat | Trabajo fuera de la herramienta, sujeto a límites del plan; registrar fuentes comprobadas y medidas del empaque. |
+| API de un proveedor | Cuenta y facturación propias; posible costo de modelo, búsqueda y extracción. Una suscripción de ChatGPT no incluye saldo API. |
+| Modelo local | Puede evitar tarifas por consulta, pero requiere hardware, memoria y mantenimiento; la búsqueda y calidad de las fuentes siguen siendo necesarias. |
+
+La integración automática aún no existe. La estrategia recomendada es identificar
+productos únicos, reutilizar referencias compatibles y guardar resultados antes
+de investigar nuevos casos. Después activar un piloto acotado con presupuesto y
+límite de solicitudes acordados, control de reintentos y prioridad en posibles
+subidas. No hay una estimación monetaria responsable sin conocer cuántos productos
+necesitan investigación, el proveedor y los límites elegidos.
+
 **El catálogo real `Seller_Activos (2).xlsx` no fue procesado:** el adjunto supera
 el límite de transferencia de la sesión. La aplicación permite cargarlo desde
 tu equipo (hasta 512 MiB). Los datos del botón **Probar demo** son ficticios.
@@ -34,7 +96,7 @@ usa este checkout existente, sin crear worktrees adicionales.
 
 ## Primer recorrido
 
-1. Pulsa **Probar demo** para cargar 12 registros ficticios, incluyendo una
+1. Pulsa **Probar demo** para cargar 16 registros ficticios, incluyendo una
    diferencia M → S sustentada en una referencia ficticia declarada verificada.
 2. Abre **Revisiones** y selecciona la cafetera del seller Mercado Centro.
 3. Compara medidas y fuente. La referencia usa `example.com`, **no es evidencia

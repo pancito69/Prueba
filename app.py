@@ -21,7 +21,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from engine import BANDS, ValidationError, calculate, canonical_hash, identity_key, suggest_mapping, trusted_reference
+from engine import BANDS, ValidationError, calculate, canonical_hash, identity_key, suggest_mapping, trusted_reference, normalize_billed_size, parse_number
+from reporting import diagnostics as diagnostic_report, diagnostic_rows, groups as review_groups, GROUP_KEY_SQL
 
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get("TALLA_DATA_DIR", ROOT / "data"))
@@ -29,10 +30,14 @@ DB = DATA / "talla.sqlite3"
 UPLOADS = DATA / "uploads"
 TASKS: queue.Queue[str | None] = queue.Queue()
 MUTATION = threading.Lock()
-FIELDS = ["seller", "sku", "name", "gtin", "brand", "model", "variant", "presentation", "packaging", "weight_g", "height_cm", "length_cm", "width_cm", "reference_verified", "source_url", "evidence_kind"]
+FIELDS = ["seller", "sku", "name", "gtin", "brand", "model", "variant", "presentation", "packaging", "weight_g", "height_cm", "length_cm", "width_cm", "reference_verified", "source_url", "evidence_kind", "billed_size"]
 MEASURES = ["weight_g", "height_cm", "length_cm", "width_cm"]
 REQUIRED = ["seller", "sku", *MEASURES]
 MAX_UPLOAD = 512 * 1024 * 1024
+LIVE_PROPOSAL_CONDITION = """candidate.base_hash=s.raw_hash AND candidate.rule_version=(SELECT version FROM settings WHERE id=1)
+  AND (candidate.reference_id IS NULL OR EXISTS(SELECT 1 FROM skus r WHERE r.id=candidate.reference_id
+    AND r.raw_hash=candidate.reference_hash AND r.is_reference=1 AND NOT EXISTS(SELECT 1 FROM skus other
+      WHERE other.identity_key=r.identity_key AND other.is_reference=1 AND other.metrics_key<>r.metrics_key)))"""
 
 
 def now():
@@ -52,7 +57,7 @@ def init_db():
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript("""
         CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), rule_mode TEXT NOT NULL, version INTEGER NOT NULL);
-        INSERT OR IGNORE INTO settings VALUES (1,'strict',1);
+        INSERT OR IGNORE INTO settings(id,rule_mode,version) VALUES (1,'strict',1);
         CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, filename TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, upload_id TEXT, filename TEXT, status TEXT, processed INTEGER DEFAULT 0,
           inserted INTEGER DEFAULT 0, updated INTEGER DEFAULT 0, unchanged INTEGER DEFAULT 0, errors INTEGER DEFAULT 0,
@@ -67,16 +72,99 @@ def init_db():
           source_url TEXT NOT NULL, source_kind TEXT NOT NULL, evidence_note TEXT NOT NULL, reason TEXT NOT NULL,
           reference_id INTEGER, reference_hash TEXT, state TEXT NOT NULL, created_at TEXT NOT NULL, decided_at TEXT, decision_note TEXT);
         CREATE INDEX IF NOT EXISTS idx_proposals_sku ON proposals(sku_id,state);
+        CREATE INDEX IF NOT EXISTS idx_proposals_reference ON proposals(reference_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_one_pending ON proposals(sku_id) WHERE state='pending';
         CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, sku_id INTEGER NOT NULL REFERENCES skus(id), action TEXT, detail TEXT, created_at TEXT);
         """)
         if "reference_revoked" not in {row["name"] for row in c.execute("PRAGMA table_info(skus)")}:
             c.execute("ALTER TABLE skus ADD COLUMN reference_revoked INTEGER DEFAULT 0")
+        columns = {row["name"] for row in c.execute("PRAGMA table_info(settings)")}
+        for name, definition in [("engine_revision", "INTEGER NOT NULL DEFAULT 1"), ("volume_ratio_threshold", "TEXT NOT NULL DEFAULT '100'")]:
+            if name not in columns:
+                c.execute(f"ALTER TABLE settings ADD COLUMN {name} {definition}")
         c.execute("UPDATE jobs SET status='failed',error='Proceso interrumpido. Puede volver a procesar el archivo; los registros ya cargados se conservan.',finished_at=? WHERE status IN ('queued','running')", (now(),))
+        c.commit()
+        if get_settings(c)["engine_revision"] < 2:
+            # Preserve a recoverable pre-migration copy before touching existing rows.
+            if c.execute("SELECT 1 FROM skus LIMIT 1").fetchone():
+                backup_path = DATA / "talla.pre-v2.sqlite3"
+                if not backup_path.exists():
+                    with sqlite3.connect(backup_path) as backup:
+                        c.backup(backup)
+            upgrade_engine(c)
+        create_analysis_view(c)
 
 
 def get_settings(c):
-    return dict(c.execute("SELECT rule_mode,version FROM settings WHERE id=1").fetchone())
+    return dict(c.execute("SELECT rule_mode,version,volume_ratio_threshold,engine_revision FROM settings WHERE id=1").fetchone())
+
+
+def upgrade_engine(c):
+    """Re-evaluate heuristics without discarding original data or decisions."""
+    config = get_settings(c)
+    last_id = 0
+    while True:
+        rows = c.execute("SELECT * FROM skus WHERE id>? ORDER BY id LIMIT 1000", (last_id,)).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            raw = json.loads(row["raw_json"])
+            digest = canonical_hash(raw)
+            if digest != row["raw_hash"]:
+                c.execute("UPDATE proposals SET base_hash=? WHERE sku_id=? AND base_hash=?", (digest, row["id"], row["raw_hash"]))
+                c.execute("UPDATE proposals SET reference_hash=? WHERE reference_id=? AND reference_hash=?", (digest, row["id"], row["raw_hash"]))
+            calc = calculate_record(raw, config["rule_mode"], config["volume_ratio_threshold"])
+            live = c.execute("SELECT state FROM proposals WHERE sku_id=? AND state IN ('pending','approved') ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
+            status = ("approved" if live["state"] == "approved" else "review") if live else calc["status"]
+            c.execute("UPDATE skus SET raw_hash=?,calculated=?,status=?,is_reference=? WHERE id=?", (digest, json.dumps(calc), status, int(trusted_reference(raw) and not row["reference_revoked"] and calc["status"] == "valid"), row["id"]))
+        last_id = rows[-1]["id"]
+    for p in c.execute("SELECT id,values_json FROM proposals"):
+        values = json.loads(p["values_json"])
+        calc = calculate_record(values, config["rule_mode"], config["volume_ratio_threshold"])
+        c.execute("UPDATE proposals SET candidate_hash=?,calculated=? WHERE id=?", (canonical_hash(values), json.dumps(calc), p["id"]))
+    c.execute("UPDATE settings SET engine_revision=2 WHERE id=1")
+    generate_proposals(c, config)
+
+
+def create_analysis_view(c):
+    sizes = [b["size"] for b in BANDS]
+    valid = ",".join("'" + s + "'" for s in sizes)
+    rank = lambda field: "CASE " + field + " " + " ".join(f"WHEN '{s}' THEN {i}" for i, s in enumerate(sizes)) + " ELSE NULL END"
+    c.execute("DROP VIEW IF EXISTS sku_analysis")
+    c.execute(f"""CREATE VIEW sku_analysis AS
+      WITH facts AS (
+        SELECT s.id,s.seller,s.sku,s.name,s.identity_key,s.raw_json,s.raw_hash,s.metrics_key,s.calculated,
+          s.is_reference,s.reference_revoked,s.job_id,s.updated_at,
+          CASE WHEN p.state='pending' THEN 'review' WHEN approved.id IS NOT NULL THEN 'approved'
+            ELSE json_extract(s.calculated,'$.status') END AS status,
+          p.id AS analysis_proposal_id,p.state AS analysis_proposal_state,p.calculated AS proposed_calculated,
+          approved.id AS effective_approved_id,approved.calculated AS effective_approved_calculated,
+          json_extract(s.calculated,'$.size') AS catalog_size,json_extract(p.calculated,'$.size') AS proposed_size,
+          CASE WHEN UPPER(TRIM(json_extract(s.raw_json,'$.billed_size'))) IN ({valid})
+            THEN UPPER(TRIM(json_extract(s.raw_json,'$.billed_size'))) ELSE NULL END AS declared_size
+        FROM skus s LEFT JOIN proposals p ON p.id=(
+          SELECT candidate.id FROM proposals candidate WHERE candidate.sku_id=s.id AND candidate.state IN ('pending','approved')
+          AND {LIVE_PROPOSAL_CONDITION}
+          ORDER BY candidate.id DESC LIMIT 1)
+        LEFT JOIN proposals approved ON approved.id=(SELECT candidate.id FROM proposals candidate
+          WHERE candidate.sku_id=s.id AND candidate.state='approved' AND {LIVE_PROPOSAL_CONDITION}
+          ORDER BY candidate.id DESC LIMIT 1)
+      ), comparisons AS (
+        SELECT *,CASE WHEN declared_size IS NOT NULL THEN declared_size WHEN analysis_proposal_id IS NOT NULL THEN catalog_size ELSE NULL END AS comparison_from_size,
+          CASE WHEN analysis_proposal_id IS NOT NULL THEN proposed_size WHEN declared_size IS NOT NULL THEN catalog_size ELSE NULL END AS comparison_to_size,
+          CASE WHEN declared_size IS NOT NULL AND analysis_proposal_id IS NOT NULL THEN 'billed_vs_proposed'
+            WHEN declared_size IS NOT NULL THEN 'billed_vs_calculated'
+            WHEN analysis_proposal_id IS NOT NULL THEN 'calculated_vs_proposed' ELSE 'unknown' END AS direction_basis
+        FROM facts
+      ) SELECT *,CASE WHEN comparison_from_size IS NULL OR comparison_to_size IS NULL THEN 'unknown'
+          WHEN {rank('comparison_to_size')} > {rank('comparison_from_size')} THEN 'up'
+          WHEN {rank('comparison_to_size')} < {rank('comparison_from_size')} THEN 'down' ELSE 'same' END AS direction,
+        CASE WHEN analysis_proposal_state='approved' THEN 'approved' WHEN analysis_proposal_state='pending' THEN 'evidence_registered'
+          WHEN is_reference=1 THEN 'declared_reference' ELSE 'unverified' END AS verification,
+        CASE WHEN analysis_proposal_state='pending' THEN json_insert(COALESCE(json_extract(calculated,'$.reason_codes'),'[]'),'$[#]','proposal_waiting')
+          WHEN analysis_proposal_state='approved' THEN COALESCE(json_extract(proposed_calculated,'$.reason_codes'),'[]')
+          ELSE COALESCE(json_extract(calculated,'$.reason_codes'),'[]') END AS reason_codes
+      FROM comparisons""")
 
 
 def audit(c, sku_id, action, detail):
@@ -163,11 +251,22 @@ def validate_headers(values):
     return headers
 
 
-def calculate_record(raw, mode):
+def calculate_record(raw, mode, volume_ratio_threshold="100"):
     try:
-        return calculate(*(raw.get(k, "") for k in MEASURES), rule_mode=mode)
+        calc = calculate(*(raw.get(k, "") for k in MEASURES), rule_mode=mode, volume_ratio_threshold=volume_ratio_threshold)
     except (ValidationError, ValueError) as e:
-        return {"size": None, "real_kg": None, "volume_kg": None, "charge_kg": None, "flags": [str(e)], "status": "pending"}
+        calc = {"size": None, "real_kg": None, "volume_kg": None, "charge_kg": None, "flags": [str(e)], "status": "pending", "reason_codes": ["invalid_physical_data"], "observations": [], "observation_codes": []}
+    if str(raw.get("billed_size") or "").strip():
+        billed = normalize_billed_size(raw["billed_size"])
+        if billed is None:
+            calc["reason_codes"].append("billed_size_invalid")
+            calc["flags"].append("La talla de cobro declarada no pertenece a la tabla de cooperados. No se supone equivalencia con la clase del Excel.")
+        elif calc["size"] and billed != calc["size"]:
+            calc["reason_codes"].append("billed_size_mismatch")
+            calc["flags"].append(f"La talla de cobro declarada ({billed}) difiere del cálculo del catálogo ({calc['size']}). Contrastar medidas antes de cambiar el cobro.")
+        if calc["reason_codes"] and calc["status"] == "valid":
+            calc["status"] = "review"
+    return calc
 
 
 def metrics_key(raw):
@@ -222,7 +321,7 @@ def process_job(job_id):
                     if previous and previous["raw_hash"] == digest:
                         counters["unchanged"] += 1
                     else:
-                        calc = calculate_record(raw, config["rule_mode"])
+                        calc = calculate_record(raw, config["rule_mode"], config["volume_ratio_threshold"])
                         trusted = int(trusted_reference(raw) and calc["status"] == "valid")
                         values = (raw.get("name", ""), identity_key(raw), json.dumps(raw, ensure_ascii=False), digest, metrics_key(raw), json.dumps(calc), calc["status"], trusted, job_id, now())
                         if previous:
@@ -263,7 +362,7 @@ def generate_proposals(c, config):
     for row in c.execute(query):
         reference = json.loads(row["ref_json"])
         values = {key: reference[key] for key in MEASURES}
-        calc = calculate_record(values, config["rule_mode"])
+        calc = calculate_record(values, config["rule_mode"], config["volume_ratio_threshold"])
         if calc["size"] is None:
             continue
         candidate = canonical_hash(values)
@@ -332,6 +431,7 @@ def settings():
 
 class RuleUpdate(BaseModel):
     rule_mode: str
+    volume_ratio_threshold: str | float | int | None = None
 
 
 @app.put("/api/settings")
@@ -340,15 +440,21 @@ def change_settings(body: RuleUpdate):
         raise HTTPException(422, "Modo de reglas inválido.")
     with mutating(), connect() as c:
         config = get_settings(c)
-        if config["rule_mode"] == body.rule_mode:
+        try:
+            threshold = parse_number(body.volume_ratio_threshold if body.volume_ratio_threshold is not None else config["volume_ratio_threshold"], "Umbral volumétrico/real")
+            if threshold < 1 or threshold > 1000000:
+                raise ValidationError("El umbral volumétrico/real debe estar entre 1 y 1.000.000.")
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        if config["rule_mode"] == body.rule_mode and threshold == parse_number(config["volume_ratio_threshold"]):
             return settings()
-        c.execute("UPDATE settings SET rule_mode=?,version=version+1 WHERE id=1", (body.rule_mode,))
+        c.execute("UPDATE settings SET rule_mode=?,volume_ratio_threshold=?,version=version+1 WHERE id=1", (body.rule_mode, str(threshold)))
         c.execute("UPDATE proposals SET state='stale' WHERE state IN ('pending','approved')")
         for row in c.execute("SELECT id,raw_json,is_reference,reference_revoked FROM skus"):
             raw = json.loads(row["raw_json"])
-            calc = calculate_record(raw, body.rule_mode)
+            calc = calculate_record(raw, body.rule_mode, str(threshold))
             c.execute("UPDATE skus SET calculated=?,status=?,is_reference=? WHERE id=?", (json.dumps(calc), calc["status"], int(trusted_reference(raw) and not row["reference_revoked"] and calc["status"] == "valid"), row["id"]))
-            audit(c, row["id"], "rules_changed", f"Política {body.rule_mode}. Las propuestas anteriores quedan obsoletas.")
+            audit(c, row["id"], "rules_changed", f"Política {body.rule_mode}; umbral volumétrico/real {threshold}. Las propuestas anteriores quedan obsoletas.")
         generate_proposals(c, get_settings(c))
     return settings()
 
@@ -356,12 +462,16 @@ def change_settings(body: RuleUpdate):
 @app.get("/api/summary")
 def summary():
     with connect() as c:
-        counts = {r["status"]: r["n"] for r in c.execute("SELECT status,COUNT(*) AS n FROM skus GROUP BY status")}
+        counts = {r["status"]: r["n"] for r in c.execute("SELECT status,COUNT(*) AS n FROM sku_analysis GROUP BY status")}
         by_size = {r["size"] or "Pendiente": r["n"] for r in c.execute("""SELECT COALESCE(
-          (SELECT json_extract(p.calculated,'$.size') FROM proposals p WHERE p.sku_id=s.id AND p.state='approved' ORDER BY p.id DESC LIMIT 1),
-          json_extract(s.calculated,'$.size')) AS size,COUNT(*) AS n FROM skus s GROUP BY size""")}
+          json_extract(effective_approved_calculated,'$.size'),json_extract(calculated,'$.size')) AS size,
+          COUNT(*) AS n FROM sku_analysis GROUP BY size""")}
         updated = c.execute("SELECT MAX(updated_at) FROM skus").fetchone()[0]
-        return {"total": sum(counts.values()), **{k: counts.get(k, 0) for k in ["valid", "review", "pending", "approved"]}, "by_size": by_size, "updated_at": updated, "rule_mode": get_settings(c)["rule_mode"]}
+        directions = {key: 0 for key in ["up", "down", "same", "unknown"]}
+        directions.update({r["direction"]: r["n"] for r in c.execute("SELECT direction,COUNT(*) n FROM sku_analysis GROUP BY direction")})
+        verification = {key: 0 for key in ["unverified", "declared_reference", "evidence_registered", "approved"]}
+        verification.update({r["verification"]: r["n"] for r in c.execute("SELECT verification,COUNT(*) n FROM sku_analysis GROUP BY verification")})
+        return {"total": sum(counts.values()), **{k: counts.get(k, 0) for k in ["valid", "review", "pending", "approved"]}, "by_size": by_size, "updated_at": updated, "rule_mode": get_settings(c)["rule_mode"], "directions": directions, "verification": verification}
 
 
 def serialize_record(row, proposal=None, approved=None):
@@ -371,14 +481,27 @@ def serialize_record(row, proposal=None, approved=None):
     if effective:
         raw = {**raw, **json.loads(effective["values_json"])}
         calc = json.loads(effective["calculated"])
-    return {**raw, **calc, "id": row["id"], "seller": row["seller"], "sku": row["sku"], "status": row["status"], "has_proposal": bool(proposal and proposal["state"] == "pending"), "is_reference": bool(row["is_reference"]), "updated_at": row["updated_at"]}
+    analysis = {k: row[k] for k in ["direction", "direction_basis", "comparison_from_size", "comparison_to_size", "verification"] if k in row.keys()}
+    if "reason_codes" in row.keys():
+        analysis["reason_codes"] = json.loads(row["reason_codes"])
+    return {**raw, **calc, **analysis, "id": row["id"], "seller": row["seller"], "sku": row["sku"], "status": row["status"], "has_proposal": bool(proposal and proposal["state"] == "pending"), "is_reference": bool(row["is_reference"]), "updated_at": row["updated_at"]}
 
 
 @app.get("/api/skus")
-def skus(page: int = 1, page_size: int = 25, search: str = "", status: str = "all"):
+def skus(page: int = 1, page_size: int = 25, search: str = "", status: str = "all", direction: str = "all", reason: str = "all"):
     if page < 1 or not 1 <= page_size <= 100:
         raise HTTPException(422, "Paginación inválida.")
     clauses, args = [], []
+    if direction != "all":
+        if direction not in {"up", "down", "same", "unknown"}:
+            raise HTTPException(422, "Dirección inválida.")
+        clauses.append("direction=?")
+        args.append(direction)
+    if reason != "all":
+        if reason not in {"invalid_physical_data", "table_gap", "above_table", "volume_weight_ratio", "proposal_waiting", "billed_size_invalid", "billed_size_mismatch"}:
+            raise HTTPException(422, "Motivo inválido.")
+        clauses.append("EXISTS(SELECT 1 FROM json_each(sku_analysis.reason_codes) WHERE value=?)")
+        args.append(reason)
     if status != "all":
         if status not in {"valid", "review", "pending", "approved"}:
             raise HTTPException(422, "Estado inválido.")
@@ -390,12 +513,12 @@ def skus(page: int = 1, page_size: int = 25, search: str = "", status: str = "al
         args.extend([term] * 3)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     with connect() as c:
-        total = c.execute("SELECT COUNT(*) FROM skus" + where, args).fetchone()[0]
-        rows = c.execute("SELECT * FROM skus" + where + " ORDER BY id DESC LIMIT ? OFFSET ?", [*args, page_size, (page - 1) * page_size]).fetchall()
+        total = c.execute("SELECT COUNT(*) FROM sku_analysis" + where, args).fetchone()[0]
+        rows = c.execute("SELECT * FROM sku_analysis" + where + " ORDER BY CASE direction WHEN 'up' THEN 0 WHEN 'unknown' THEN 1 WHEN 'same' THEN 2 ELSE 3 END,id DESC LIMIT ? OFFSET ?", [*args, page_size, (page - 1) * page_size]).fetchall()
         result = []
         for row in rows:
-            proposal = c.execute("SELECT * FROM proposals WHERE sku_id=? AND state IN ('pending','approved') ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
-            approved = c.execute("SELECT * FROM proposals WHERE sku_id=? AND state='approved' ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
+            proposal = c.execute("SELECT * FROM proposals WHERE id=?", (row["analysis_proposal_id"],)).fetchone()
+            approved = c.execute("SELECT * FROM proposals WHERE id=?", (row["effective_approved_id"],)).fetchone()
             result.append(serialize_record(row, proposal, approved))
         return {"items": result, "total": total, "page": page, "pages": max(1, (total + page_size - 1) // page_size)}
 
@@ -403,15 +526,21 @@ def skus(page: int = 1, page_size: int = 25, search: str = "", status: str = "al
 @app.get("/api/skus/{sku_id}")
 def detail(sku_id: int):
     with connect() as c:
-        row = c.execute("SELECT * FROM skus WHERE id=?", (sku_id,)).fetchone()
+        row = c.execute("SELECT * FROM sku_analysis WHERE id=?", (sku_id,)).fetchone()
         if not row:
             raise HTTPException(404, "SKU no encontrado.")
-        proposal = c.execute("SELECT * FROM proposals WHERE sku_id=? ORDER BY CASE WHEN state IN ('pending','approved') THEN 0 ELSE 1 END,id DESC LIMIT 1", (sku_id,)).fetchone()
+        proposal = c.execute("SELECT * FROM proposals WHERE id=?", (row["analysis_proposal_id"],)).fetchone()
+        if not proposal:
+            historical = c.execute("SELECT * FROM proposals WHERE sku_id=? ORDER BY id DESC LIMIT 1", (sku_id,)).fetchone()
+            if historical:
+                proposal = dict(historical)
+                if proposal["state"] in {"pending", "approved"}:
+                    proposal["state"] = "stale"
         history = [dict(r) for r in c.execute("SELECT action,detail,created_at FROM history WHERE sku_id=? ORDER BY id DESC LIMIT 50", (sku_id,))]
         p = None
         if proposal:
             p = {**dict(proposal), **json.loads(proposal["values_json"]), **json.loads(proposal["calculated"])}
-        approved = c.execute("SELECT * FROM proposals WHERE sku_id=? AND state='approved' ORDER BY id DESC LIMIT 1", (sku_id,)).fetchone()
+        approved = c.execute("SELECT * FROM proposals WHERE id=?", (row["effective_approved_id"],)).fetchone()
         return {"record": serialize_record(row, proposal, approved), "original": json.loads(row["raw_json"]), "original_calculated": json.loads(row["calculated"]), "proposal": p, "history": history}
 
 
@@ -447,7 +576,7 @@ def propose(sku_id: int, body: ProposalInput):
         values = {key: str(getattr(body, key)) for key in MEASURES}
         config = get_settings(c)
         try:
-            calc = calculate(*(values[k] for k in MEASURES), rule_mode=config["rule_mode"])
+            calc = calculate(*(values[k] for k in MEASURES), rule_mode=config["rule_mode"], volume_ratio_threshold=config["volume_ratio_threshold"])
         except ValueError as e:
             raise HTTPException(422, str(e))
         if calc["size"] is None:
@@ -464,42 +593,98 @@ class Decision(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
-@app.post("/api/proposals/{proposal_id}/decision")
-def decide(proposal_id: int, body: Decision):
+def decide_one(c, proposal_id: int, body: Decision):
     if body.decision not in {"approve", "reject"}:
         raise HTTPException(422, "Decisión inválida.")
+    p = c.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
+    if not p:
+        raise HTTPException(404, "Propuesta no encontrada.")
+    if p["state"] != "pending":
+        raise HTTPException(409, "La propuesta ya fue revisada o quedó obsoleta.")
+    row = c.execute("SELECT * FROM skus WHERE id=?", (p["sku_id"],)).fetchone()
+    if p["base_hash"] != row["raw_hash"] or p["rule_version"] != get_settings(c)["version"]:
+        raise HTTPException(409, "El catálogo o las reglas cambiaron. Revise una nueva propuesta.")
+    if p["reference_id"]:
+        ref = c.execute("SELECT raw_hash,is_reference,identity_key,metrics_key FROM skus WHERE id=?", (p["reference_id"],)).fetchone()
+        if not ref or not ref["is_reference"] or ref["raw_hash"] != p["reference_hash"]:
+            raise HTTPException(409, "La referencia cambió o dejó de estar verificada. Cree una nueva propuesta.")
+        if c.execute("SELECT 1 FROM skus WHERE identity_key=? AND is_reference=1 AND metrics_key<>? LIMIT 1", (ref["identity_key"], ref["metrics_key"])).fetchone():
+            raise HTTPException(409, "Hay referencias verificadas contradictorias. Resuelva la evidencia antes de aprobar.")
+    state = "approved" if body.decision == "approve" else "rejected"
+    if state == "approved":
+        c.execute("UPDATE proposals SET state='superseded' WHERE sku_id=? AND state='approved'", (p["sku_id"],))
+    c.execute("UPDATE proposals SET state=?,decided_at=?,decision_note=? WHERE id=?", (state, now(), body.note, proposal_id))
+    if state == "approved":
+        status = "approved"
+    elif c.execute("SELECT 1 FROM proposals WHERE sku_id=? AND state='approved'", (p["sku_id"],)).fetchone():
+        status = "approved"
+    else:
+        status = json.loads(row["calculated"])["status"]
+    c.execute("UPDATE skus SET status=?,updated_at=? WHERE id=?", (status, now(), p["sku_id"]))
+    audit(c, p["sku_id"], state, json.dumps({"proposal_id": proposal_id, "note": body.note}, ensure_ascii=False))
+    if state == "approved" and row["is_reference"]:
+        c.execute("UPDATE skus SET is_reference=0,reference_revoked=1 WHERE id=?", (p["sku_id"],))
+        audit(c, p["sku_id"], "reference_revoked", "Referencia corregida: sus datos originales dejan de respaldar propuestas de otros sellers.")
+        invalidate_references(c)
+    return {"state": state}
+
+
+@app.post("/api/proposals/{proposal_id}/decision")
+def decide(proposal_id: int, body: Decision):
     with mutating(), connect() as c:
-        p = c.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
-        if not p:
-            raise HTTPException(404, "Propuesta no encontrada.")
-        if p["state"] != "pending":
-            raise HTTPException(409, "La propuesta ya fue revisada o quedó obsoleta.")
-        row = c.execute("SELECT * FROM skus WHERE id=?", (p["sku_id"],)).fetchone()
-        if p["base_hash"] != row["raw_hash"] or p["rule_version"] != get_settings(c)["version"]:
-            raise HTTPException(409, "El catálogo o las reglas cambiaron. Revise una nueva propuesta.")
-        if p["reference_id"]:
-            ref = c.execute("SELECT raw_hash,is_reference,identity_key,metrics_key FROM skus WHERE id=?", (p["reference_id"],)).fetchone()
-            if not ref or not ref["is_reference"] or ref["raw_hash"] != p["reference_hash"]:
-                raise HTTPException(409, "La referencia cambió o dejó de estar verificada. Cree una nueva propuesta.")
-            if c.execute("SELECT 1 FROM skus WHERE identity_key=? AND is_reference=1 AND metrics_key<>? LIMIT 1", (ref["identity_key"], ref["metrics_key"])).fetchone():
-                raise HTTPException(409, "Hay referencias verificadas contradictorias. Resuelva la evidencia antes de aprobar.")
-        state = "approved" if body.decision == "approve" else "rejected"
-        if state == "approved":
-            c.execute("UPDATE proposals SET state='superseded' WHERE sku_id=? AND state='approved'", (p["sku_id"],))
-        c.execute("UPDATE proposals SET state=?,decided_at=?,decision_note=? WHERE id=?", (state, now(), body.note, proposal_id))
-        if state == "approved":
-            status = "approved"
-        elif c.execute("SELECT 1 FROM proposals WHERE sku_id=? AND state='approved'", (p["sku_id"],)).fetchone():
-            status = "approved"
-        else:
-            status = json.loads(row["calculated"])["status"]
-        c.execute("UPDATE skus SET status=?,updated_at=? WHERE id=?", (status, now(), p["sku_id"]))
-        audit(c, p["sku_id"], state, json.dumps({"proposal_id": proposal_id, "note": body.note}, ensure_ascii=False))
-        if state == "approved" and row["is_reference"]:
-            c.execute("UPDATE skus SET is_reference=0,reference_revoked=1 WHERE id=?", (p["sku_id"],))
-            audit(c, p["sku_id"], "reference_revoked", "Referencia corregida: sus datos originales dejan de respaldar propuestas de otros sellers.")
-            invalidate_references(c)
-        return {"state": state}
+        return decide_one(c, proposal_id, body)
+
+
+@app.get("/api/diagnostics")
+def diagnostics():
+    with connect() as c:
+        return diagnostic_report(c)
+
+
+@app.get("/api/diagnostics.csv")
+def diagnostics_export(scope: str = "attention"):
+    if scope not in {"attention", "all"}:
+        raise HTTPException(422, "El alcance debe ser attention o all.")
+    def rows():
+        with connect() as c:
+            yield from diagnostic_rows(c, scope)
+    return csv_response(rows(), "diagnostico_catalogo.csv")
+
+
+@app.get("/api/groups")
+def groups(page: int = 1, page_size: int = 20, direction: str = "all"):
+    with connect() as c:
+        try:
+            return review_groups(c, page, page_size, direction)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+
+
+class GroupDecision(Decision):
+    proposal_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+@app.post("/api/groups/decision")
+def decide_group(body: GroupDecision):
+    if body.decision not in {"approve", "reject"}:
+        raise HTTPException(422, "Decisión inválida.")
+    if body.decision == "reject" and not body.note.strip():
+        raise HTTPException(422, "Indique el motivo del rechazo.")
+    if len(set(body.proposal_ids)) != len(body.proposal_ids):
+        raise HTTPException(422, "La selección contiene propuestas repetidas.")
+    with mutating(), connect() as c:
+        placeholders = ",".join("?" for _ in body.proposal_ids)
+        eligible = c.execute(f"""SELECT p.id,{GROUP_KEY_SQL} AS group_key FROM sku_analysis s
+          JOIN proposals p ON p.id=s.analysis_proposal_id
+          WHERE p.id IN ({placeholders}) AND s.analysis_proposal_state='pending' AND p.state='pending'""", body.proposal_ids).fetchall()
+        if len(eligible) != len(body.proposal_ids):
+            raise HTTPException(409, "La selección incluye una propuesta revisada, obsoleta o con evidencia desactualizada. Actualice el grupo.")
+        if len({r["group_key"] for r in eligible}) != 1:
+            raise HTTPException(422, "El lote mezcla productos, evidencia, valores o comparaciones diferentes. Revise cada grupo por separado.")
+        # One transaction: any stale member prevents the whole selected batch.
+        for proposal_id in body.proposal_ids:
+            decide_one(c, proposal_id, body)
+        return {"state": "approved" if body.decision == "approve" else "rejected", "processed": len(body.proposal_ids)}
 
 
 def safe_cell(value):
@@ -640,7 +825,12 @@ def demo():
     upload_id = uuid.uuid4().hex
     with connect() as c:
         c.execute("INSERT INTO uploads VALUES (?,?,?,?)", (upload_id, "DEMO · datos ficticios.csv", str(path), now()))
-    return enqueue(upload_id, ProcessInput(mapping={key: key for key in FIELDS}, trust_references=True))
+    iterator = read_rows(path)
+    try:
+        headers = next(iterator)
+    finally:
+        iterator.close()
+    return enqueue(upload_id, ProcessInput(mapping={key: key for key in FIELDS if key in headers}, trust_references=True))
 
 
 @app.get("/")

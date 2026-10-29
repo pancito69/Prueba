@@ -39,6 +39,16 @@ def main():
             result["persisted"] = c.execute("SELECT COUNT(*) FROM skus").fetchone()[0]
             result["classified_S"] = c.execute("SELECT COUNT(*) FROM skus WHERE json_extract(calculated,'$.size')='S'").fetchone()[0]
         result["seconds"] = round(elapsed, 2)
+        start = time.perf_counter()
+        summary = app.summary()
+        result["summary_seconds"] = round(time.perf_counter() - start, 2)
+        start = time.perf_counter()
+        diagnostic = app.diagnostics()
+        result["diagnostics_seconds"] = round(time.perf_counter() - start, 2)
+        start = time.perf_counter()
+        page = app.skus(page=1, page_size=25)
+        result["page_seconds"] = round(time.perf_counter() - start, 2)
+        assert summary["total"] == args.rows and diagnostic["total"] == args.rows and page["total"] == args.rows
         print(json.dumps(result, ensure_ascii=False))
         if result["status"] != "completed" or result["persisted"] != args.rows or result["classified_S"] != args.rows or result["errors"]:
             raise SystemExit(1)

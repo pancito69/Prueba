@@ -6,9 +6,11 @@ All catalogues, sources and identifiers below are fictitious; no network calls.
 from __future__ import annotations
 
 import csv
+from hashlib import sha256
 import io
 import json
 import os
+import sqlite3
 from pathlib import Path
 import sys
 import tempfile
@@ -24,12 +26,43 @@ import app as application
 from engine import BANDS, ValidationError, calculate, canonical_hash, identity_key, parse_number
 
 
+def legacy_v1_hash(record):
+    """Frozen canonical_hash from engine.py at a077591, before billed_size.
+
+    Keep this field list independent of today's engine so the migration fixture
+    exercises an actual algorithm change rather than writing v2 hashes to v1.
+    """
+    fields = (
+        "seller", "sku", "name", "gtin", "brand", "model", "variant", "presentation",
+        "packaging", "weight_g", "height_cm", "length_cm", "width_cm",
+        "reference_verified", "source_url", "evidence_kind",
+    )
+    normalized = {}
+    for field in fields:
+        value = record.get(field)
+        if field in {"weight_g", "height_cm", "length_cm", "width_cm"}:
+            try:
+                text = format(parse_number(value, field), "f")
+                if "." in text:
+                    text = text.rstrip("0").rstrip(".")
+                normalized[field] = "0" if text in {"-0", ""} else text
+            except ValidationError:
+                normalized[field] = str(value or "").strip()
+        elif field == "reference_verified":
+            normalized[field] = value is True or str(value).strip().casefold() in {
+                "1", "true", "si", "sí", "yes", "verificado"}
+        else:
+            normalized[field] = str(value or "").strip()
+    encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def product(seller="Seller A", sku="SKU-1", **overrides):
     row = dict(seller=seller, sku=sku, name="Producto ficticio", gtin="",
                brand="Marca de prueba", model="Modelo-1", variant="Única",
                presentation="Unidad", packaging="Caja comercial de envío",
                weight_g="1200", height_cm="100", length_cm="30", width_cm="20",
-               reference_verified="false", source_url="", evidence_kind="")
+               reference_verified="false", source_url="", evidence_kind="", billed_size="")
     row.update(overrides)
     return row
 
@@ -90,6 +123,26 @@ class RulesTests(unittest.TestCase):
         second = product(weight_g="1.12345678901234567890123456788")
         self.assertNotEqual(application.metrics_key(first), application.metrics_key(second))
 
+    def test_long_dimension_is_an_observation_not_an_error(self):
+        result = calculate("2000", "320", "10", "10")
+        self.assertEqual(result["size"], "S")
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(result["flags"], [])
+        self.assertIn("long_dimension", result["observation_codes"])
+        self.assertTrue(result["observations"])
+
+    def test_volume_ratio_threshold_is_configurable_and_does_not_change_size(self):
+        default = calculate("10", "100", "10", "10")
+        adjusted = calculate("10", "100", "10", "10", volume_ratio_threshold="250")
+        self.assertEqual(default["size"], adjusted["size"])
+        self.assertIn("volume_weight_ratio", default["reason_codes"])
+        self.assertEqual(default["status"], "review")
+        self.assertEqual(adjusted["status"], "valid")
+        self.assertNotIn("volume_weight_ratio", adjusted["reason_codes"])
+        for invalid in ("0", "-1", "NaN", "1000001"):
+            with self.subTest(threshold=invalid), self.assertRaises(ValidationError):
+                calculate("10", "100", "10", "10", volume_ratio_threshold=invalid)
+
 
 class ApplicationTests(unittest.TestCase):
     @classmethod
@@ -107,7 +160,7 @@ class ApplicationTests(unittest.TestCase):
         with application.connect() as db:
             for table in ("history", "proposals", "skus", "jobs", "uploads"):
                 db.execute(f"DELETE FROM {table}")
-            db.execute("UPDATE settings SET rule_mode='strict',version=1 WHERE id=1")
+            db.execute("UPDATE settings SET rule_mode='strict',version=1,volume_ratio_threshold='100' WHERE id=1")
 
     def wait(self, job_id):
         deadline = time.monotonic() + 10
@@ -280,6 +333,11 @@ class ApplicationTests(unittest.TestCase):
                     application.metrics_key(conflicting), json.dumps(calc), calc["status"], 1,
                     application.now()))
         self.assertEqual(self.export_rows(), [])
+        self.assertEqual(self.client.get("/api/summary").json()["approved"], 0)
+        conflicted = self.get_sku()
+        self.assertNotEqual(conflicted["record"]["status"], "approved")
+        self.assertEqual(conflicted["record"]["size"], "M")
+        self.assertEqual(conflicted["proposal"]["state"], "stale")
         response = self.approve(pending)
         self.assertEqual(response.status_code, 409, response.text)
 
@@ -331,6 +389,199 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(response.json()["rule_mode"], "upper_bounds")
         self.assertEqual(self.export_rows(), [])
         self.assertEqual(self.get_sku()["proposal"]["state"], "stale")
+
+    def test_direction_filter_uses_explicit_charging_size_only(self):
+        self.upload([
+            product(sku="UP", billed_size="XXS"),
+            product(sku="DOWN", billed_size="XL"),
+            product(sku="SAME", billed_size="M"),
+            product(sku="UNKNOWN"),
+            product(sku="LEGACY", billed_size="Clase antigua 4"),
+        ])
+        expected = {"up": {"UP"}, "down": {"DOWN"}, "same": {"SAME"},
+                    "unknown": {"UNKNOWN", "LEGACY"}}
+        for direction, expected_skus in expected.items():
+            with self.subTest(direction=direction):
+                response = self.client.get("/api/skus", params={"direction": direction})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual({item["sku"] for item in response.json()["items"]}, expected_skus)
+        legacy = self.get_sku(sku="LEGACY")["record"]
+        self.assertIn("billed_size_invalid", legacy["reason_codes"])
+        self.assertEqual(legacy["direction"], "unknown")
+
+    def test_proposal_direction_uses_billed_size_when_available(self):
+        self.upload([product(), product(sku="BILLED", billed_size="XXS"), reference()], trust=True)
+        original_comparison = self.get_sku()["record"]
+        billed_comparison = self.get_sku(sku="BILLED")["record"]
+        self.assertEqual(original_comparison["direction"], "down")
+        self.assertEqual(billed_comparison["direction"], "up")
+
+    def test_settings_threshold_recalculates_alerts(self):
+        self.upload([product(weight_g="10", height_cm="100", length_cm="10", width_cm="10")])
+        self.assertEqual(self.get_sku()["record"]["status"], "review")
+        response = self.client.put("/api/settings", json={"rule_mode": "strict", "volume_ratio_threshold": "250"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(str(response.json()["volume_ratio_threshold"]), "250")
+        self.assertEqual(self.get_sku()["record"]["status"], "valid")
+        self.assertEqual(self.get_sku()["record"]["size"], "XS")
+        settings = self.client.get("/api/settings").json()
+        self.assertEqual(str(settings["volume_ratio_threshold"]), "250")
+
+    def test_diagnostics_separates_alerts_observations_and_research_work(self):
+        self.upload([
+            product(sku="RATIO-1", weight_g="10", height_cm="100", length_cm="10", width_cm="10"),
+            product("Seller B", "RATIO-2", weight_g="10", height_cm="100", length_cm="10", width_cm="10"),
+            product(sku="=bad()", height_cm="", brand="", model="", variant="", packaging=""),
+            product(sku="LONG", weight_g="2000", height_cm="320", length_cm="10", width_cm="10"),
+            product(sku="LEGACY", billed_size="Clase antigua 4"),
+        ])
+        response = self.client.get("/api/diagnostics")
+        self.assertEqual(response.status_code, 200, response.text)
+        diagnostics = response.json()
+        self.assertEqual((diagnostics["total"], diagnostics["attention"]), (5, 4))
+        counts = {reason["code"]: reason["count"] for reason in diagnostics["reasons"]}
+        self.assertEqual(counts["volume_weight_ratio"], 2)
+        self.assertEqual(counts["invalid_physical_data"], 1)
+        self.assertEqual(counts["billed_size_invalid"], 1)
+        self.assertNotIn("long_dimension", counts)
+        self.assertEqual(diagnostics["research"], {
+            "attention_rows": 4, "identifiable_rows": 3, "unique_products": 1,
+            "missing_identity_rows": 1, "with_proposal_rows": 0, "without_proposal_rows": 4})
+        self.assertEqual(diagnostics["directions"]["unknown"], 5)
+        self.assertEqual(diagnostics["verification"]["unverified"], 5)
+        self.assertEqual(diagnostics["ai"], {"enabled": False, "external_requests": 0})
+        csv_response = self.client.get("/api/diagnostics.csv")
+        self.assertEqual(csv_response.status_code, 200)
+        rows = list(csv.DictReader(io.StringIO(csv_response.content.decode("utf-8-sig"))))
+        self.assertEqual(len(rows), 4)
+        self.assertNotIn("LONG", {row["SKU"] for row in rows})
+        self.assertIn("'=bad()", {row["SKU"] for row in rows})
+        all_response = self.client.get("/api/diagnostics.csv", params={"scope": "all"})
+        all_rows = list(csv.DictReader(io.StringIO(all_response.content.decode("utf-8-sig"))))
+        self.assertEqual(len(all_rows), 5)
+        long_row = next(row for row in all_rows if row["SKU"] == "LONG")
+        self.assertTrue(long_row["Observaciones"])
+        self.assertEqual(long_row["Alertas"], "")
+
+    def test_group_decision_approves_same_product_and_evidence_atomically(self):
+        self.upload([product(), product("Seller B", "SKU-2"), reference()], trust=True)
+        groups_response = self.client.get("/api/groups")
+        self.assertEqual(groups_response.status_code, 200, groups_response.text)
+        groups = groups_response.json()["items"]
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertEqual((group["count"], group["seller_count"]), (2, 2))
+        self.assertEqual(group["direction"], "down")
+        self.assertEqual(len(group["proposal_ids"]), 2)
+        response = self.client.post("/api/groups/decision", json={
+            "proposal_ids": group["proposal_ids"], "decision": "approve", "note": "Evidencia común revisada"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.export_rows()), 2)
+        self.assertEqual(self.get_sku()["proposal"]["state"], "approved")
+        self.assertEqual(self.get_sku("Seller B", "SKU-2")["proposal"]["state"], "approved")
+
+    def test_group_decision_rejects_different_products_without_partial_approval(self):
+        self.upload([product(), product(sku="SKU-2", model="Otro modelo")])
+        first = self.correction(self.get_sku()["record"]["id"])
+        second = self.correction(self.get_sku(sku="SKU-2")["record"]["id"])
+        response = self.client.post("/api/groups/decision", json={
+            "proposal_ids": [first, second], "decision": "approve", "note": "No mezclar productos"})
+        self.assertIn(response.status_code, {409, 422}, response.text)
+        self.assertEqual(self.export_rows(), [])
+        self.assertEqual(self.get_sku()["proposal"]["state"], "pending")
+        self.assertEqual(self.get_sku(sku="SKU-2")["proposal"]["state"], "pending")
+
+    def test_group_decision_rejects_different_evidence_without_partial_approval(self):
+        self.upload([product(), product(sku="SKU-2")])
+        first = self.correction(self.get_sku()["record"]["id"])
+        second = self.correction(self.get_sku(sku="SKU-2")["record"]["id"], source_url="https://example.com/otra-medicion")
+        response = self.client.post("/api/groups/decision", json={
+            "proposal_ids": [first, second], "decision": "approve", "note": "No mezclar evidencia"})
+        self.assertIn(response.status_code, {409, 422}, response.text)
+        self.assertEqual(self.export_rows(), [])
+        self.assertEqual(self.get_sku()["proposal"]["state"], "pending")
+
+    def test_group_decision_rolls_back_if_one_proposal_is_stale(self):
+        self.upload([product(), product(sku="SKU-2"), reference()], trust=True)
+        first = self.get_sku()["proposal"]["id"]
+        second = self.get_sku(sku="SKU-2")["proposal"]["id"]
+        with application.connect() as db:
+            db.execute("UPDATE proposals SET state='stale' WHERE id=?", (second,))
+        response = self.client.post("/api/groups/decision", json={
+            "proposal_ids": [first, second], "decision": "approve", "note": "Comprobar atomicidad"})
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.export_rows(), [])
+        self.assertEqual(self.get_sku()["proposal"]["state"], "pending")
+
+    def test_migration_from_v1_preserves_approval_and_reclassifies_long_dimension(self):
+        saved_paths = application.DATA, application.DB, application.UPLOADS
+        with tempfile.TemporaryDirectory(prefix="talla-v1-") as directory:
+            try:
+                application.DATA = Path(directory)
+                application.DB = Path(directory) / "talla.sqlite3"
+                application.UPLOADS = Path(directory) / "uploads"
+                long_raw = product(sku="LONG", weight_g="2000", height_cm="320", length_cm="10", width_cm="10")
+                approved_raw = product(sku="APPROVED")
+                for raw in (long_raw, approved_raw):
+                    raw.pop("billed_size", None)
+                long_old = calculate("2000", "320", "10", "10")
+                long_old.update(status="review", flags=["Alguna dimensión supera 300 cm: verificar el empaque de envío."])
+                for key in ("observations", "observation_codes", "reason_codes"):
+                    long_old.pop(key, None)
+                approved_calc = calculate("1200", "100", "30", "20")
+                proposed_values = dict(weight_g="1200", height_cm="40", length_cm="30", width_cm="20")
+                proposed_calc = calculate("1200", "40", "30", "20")
+                self.assertNotEqual(legacy_v1_hash(approved_raw), canonical_hash(approved_raw))
+                self.assertNotEqual(legacy_v1_hash(proposed_values), canonical_hash(proposed_values))
+                with sqlite3.connect(application.DB) as db:
+                    db.executescript("""
+                    CREATE TABLE settings(id INTEGER PRIMARY KEY,rule_mode TEXT NOT NULL,version INTEGER NOT NULL);
+                    INSERT INTO settings VALUES(1,'strict',1);
+                    CREATE TABLE skus(id INTEGER PRIMARY KEY,seller TEXT NOT NULL,sku TEXT NOT NULL,name TEXT,
+                      identity_key TEXT,raw_json TEXT NOT NULL,raw_hash TEXT NOT NULL,metrics_key TEXT,calculated TEXT NOT NULL,
+                      status TEXT NOT NULL,is_reference INTEGER DEFAULT 0,job_id TEXT,updated_at TEXT,UNIQUE(seller,sku));
+                    CREATE TABLE proposals(id INTEGER PRIMARY KEY,sku_id INTEGER NOT NULL REFERENCES skus(id),base_hash TEXT NOT NULL,
+                      candidate_hash TEXT NOT NULL,rule_version INTEGER NOT NULL,values_json TEXT NOT NULL,calculated TEXT NOT NULL,
+                      source_url TEXT NOT NULL,source_kind TEXT NOT NULL,evidence_note TEXT NOT NULL,reason TEXT NOT NULL,
+                      reference_id INTEGER,reference_hash TEXT,state TEXT NOT NULL,created_at TEXT NOT NULL,decided_at TEXT,decision_note TEXT);
+                    """)
+                    for raw, calc, status in ((long_raw, long_old, "review"), (approved_raw, approved_calc, "approved")):
+                        db.execute("""INSERT INTO skus(seller,sku,name,identity_key,raw_json,raw_hash,metrics_key,
+                            calculated,status,is_reference,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
+                                raw["seller"], raw["sku"], raw["name"], identity_key(raw), json.dumps(raw),
+                                legacy_v1_hash(raw), application.metrics_key(raw), json.dumps(calc), status, 0,
+                                application.now()))
+                    db.execute("""INSERT INTO proposals(sku_id,base_hash,candidate_hash,rule_version,values_json,calculated,
+                        source_url,source_kind,evidence_note,reason,state,created_at,decided_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (2, legacy_v1_hash(approved_raw), legacy_v1_hash(proposed_values),
+                            1, json.dumps(proposed_values), json.dumps(proposed_calc), "https://example.com/v1",
+                            "medicion_logistica", "Evidencia previa válida del mismo paquete.", "Corrección aprobada en v1",
+                            "approved", application.now(), application.now()))
+                application.init_db()
+                with application.connect() as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM skus").fetchone()[0], 2)
+                    settings = application.get_settings(db)
+                    self.assertEqual(str(settings["volume_ratio_threshold"]), "100")
+                    long_row = db.execute("SELECT status,calculated,raw_json FROM skus WHERE sku='LONG'").fetchone()
+                    self.assertEqual(long_row["status"], "valid")
+                    self.assertIn("long_dimension", json.loads(long_row["calculated"])["observation_codes"])
+                    self.assertEqual(json.loads(long_row["raw_json"]), long_raw)
+                    proposal = db.execute("SELECT state,base_hash,candidate_hash FROM proposals WHERE sku_id=2").fetchone()
+                    self.assertEqual(proposal["state"], "approved")
+                    self.assertEqual(proposal["base_hash"], canonical_hash(approved_raw))
+                    self.assertEqual(proposal["candidate_hash"], canonical_hash(proposed_values))
+                    self.assertEqual(db.execute("SELECT raw_hash FROM skus WHERE sku='APPROVED'").fetchone()[0], canonical_hash(approved_raw))
+                rows = self.export_rows()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual((rows[0]["SKU"], rows[0]["Talla"]), ("APPROVED", "S"))
+                reimported = self.upload([approved_raw])
+                self.assertEqual((reimported["unchanged"], reimported["updated"], reimported["inserted"]), (1, 0, 0))
+                migrated_detail = self.get_sku(sku="APPROVED")
+                self.assertEqual(migrated_detail["proposal"]["state"], "approved")
+                self.assertEqual(migrated_detail["record"]["size"], "S")
+                self.assertEqual(self.export_rows(), rows)
+            finally:
+                application.DATA, application.DB, application.UPLOADS = saved_paths
 
 
 if __name__ == "__main__":
