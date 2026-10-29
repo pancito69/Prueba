@@ -1,0 +1,28 @@
+TALLA · CONTROL LOGÍSTICO — PILOTO
+
+1. Descomprime el ZIP en una carpeta de tu equipo.
+2. Instala Python 3.12 si todavía no lo tienes.
+3. Windows: abre iniciar.bat con doble clic.
+   Mac/Linux: abre una terminal en esta carpeta y escribe python3 iniciar.py.
+   La primera vez se necesita Internet para instalar las dependencias.
+4. Deja esa ventana abierta y abre en el navegador la dirección que indica.
+5. Pulsa «Probar demo» para recorrer un ejemplo con datos ficticios.
+6. Para trabajar con tu catálogo, usa «Cargar catálogo», elige CSV o XLSX,
+   asigna las columnas y pulsa «Analizar catálogo».
+7. En «Revisiones», abre un SKU y revisa o registra su propuesta con evidencia.
+   Aprueba solo las correcciones que correspondan al mismo producto y empaque.
+8. Usa «Exportar aprobados» para obtener el archivo de cambios.
+
+El catálogo real adjuntado en la conversación NO fue procesado.
+La herramienta no aplica cambios a tu sistema de origen ni modifica cobros.
+La búsqueda automática con IA no está conectada; se registra evidencia obtenida
+por el operador o declarada verificada al importar referencias.
+
+La tabla literal mantiene los huecos como pendientes. En «Reglas de talla» puedes
+elegir límites continuos cuando negocio haya confirmado ese criterio.
+
+IMPORTANTE: los datos demo son ficticios. Para trabajar con datos reales separados,
+consulta la sección «Primer recorrido» del README; usa otro directorio de datos.
+El piloto es local y no tiene usuarios/contraseñas: no lo publiques en Internet.
+
+Detalles, reglas, formatos y pruebas: README.md
