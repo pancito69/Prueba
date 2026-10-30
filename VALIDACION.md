@@ -2,7 +2,7 @@
 
 ## Comprobado
 
-- **59 pruebas automatizadas aprobadas** con `unittest`: cálculo en gramos/cm,
+- **68 pruebas automatizadas aprobadas** con `unittest`: cálculo en gramos/cm,
   divisor 5000, cada límite de talla, huecos, entradas inválidas, conservación de
   precisión decimal, CSV/XLSX, cargas idénticas, duplicados, confianza explícita,
   coincidencia de presentación/empaque, fuentes contradictorias, propuestas,
@@ -16,6 +16,10 @@
   evidencia por campo, conversión de unidades, mínimos no exportables, abstención,
   contradicciones históricas, reimportaciones, snapshots obsoletos y reintentos
   auditados que respetan aprobaciones y rechazos previos.
+  Nueve pruebas adicionales verifican arranque: exclusión entre procesos,
+  liberación al fallar, SQLite ocupado sin pérdida de datos, migración con progreso
+  que no se repite al reiniciar, rechazo de puerto ocupado y comprobación de la
+  instancia propia antes de anunciar la URL.
 - Navegador Chromium: demo, importación CSV con mapeo, propuesta manual,
   aprobación M → S, descarga CSV, reimportación sin duplicados, reglas y vista
   móvil de 390 px. Sin errores JavaScript observados.
@@ -29,6 +33,15 @@
   una regla de plausibilidad. Las capturas contienen datos ficticios.
 - Instancia limpia iniciada: interfaz, JavaScript, API de salud y resumen
   respondieron HTTP 200. El catálogo operativo se dejó vacío.
+  El iniciador actualizado se probó con servidor real y una base temporal: la
+  dirección se anunció tras HTTP 200 de la instancia correcta; la interfaz respondió
+  y el cierre liberó el proceso. Los bloqueos entre procesos se ejecutaron en Linux;
+  la rama `msvcrt` de Windows usa su bloqueo nativo y no se ejecutó en esta máquina.
+
+- Migración aislada desde v2 auténtica: **400.000 registros sintéticos**, respaldo
+  de 260.411.392 bytes y **400 aprobaciones conservadas**. La migración completó
+  en 25,29 s sin bloqueo. Esto no identifica al proceso que bloqueó la base del
+  equipo del usuario; su traza falló antes de migrar, en el esquema inicial.
 - Carga sintética aislada mediante `python scripts/benchmark.py --rows 400000`:
   **400.000 procesados, 400.000 persistidos, 400.000 clasificados S, 0 errores**.
   En v3 se evaluaron **100 reglas ficticias de categoría** durante la carga.

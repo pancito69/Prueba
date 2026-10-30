@@ -5,11 +5,13 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import os
 import queue
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager, contextmanager
@@ -26,6 +28,7 @@ from engine import BANDS, ValidationError, calculate, canonical_hash, identity_k
 from reporting import diagnostics as diagnostic_report, diagnostic_rows, groups as review_groups, GROUP_KEY_SQL
 from categories import CategoryEngine, init_schema as init_category_schema, list_rules, save_rule, delete_rule
 from research import init_schema as init_research_schema, register_routes as register_research_routes
+from startup_lock import exclusive_instance
 
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get("TALLA_DATA_DIR", ROOT / "data"))
@@ -37,6 +40,7 @@ FIELDS = ["seller", "sku", "name", "gtin", "brand", "model", "variant", "present
 MEASURES = ["weight_g", "height_cm", "length_cm", "width_cm"]
 REQUIRED = ["seller", "sku", *MEASURES]
 MAX_UPLOAD = 512 * 1024 * 1024
+LOG = logging.getLogger("uvicorn.error")
 LIVE_PROPOSAL_CONDITION = """candidate.base_hash=s.raw_hash AND candidate.rule_version=(SELECT version FROM settings WHERE id=1)
   AND (candidate.reference_id IS NULL OR EXISTS(SELECT 1 FROM skus r WHERE r.id=candidate.reference_id
     AND r.raw_hash=candidate.reference_hash AND r.is_reference=1 AND NOT EXISTS(SELECT 1 FROM skus other
@@ -54,10 +58,30 @@ def connect():
     return c
 
 
-def init_db():
+def init_db(*, busy_timeout_ms=5000):
+    try:
+        _initialize_database(busy_timeout_ms)
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            raise RuntimeError(
+                f"La base de datos está ocupada: {DB.resolve()}. "
+                "Cierra las otras instancias de Talla con Ctrl+C y cualquier programa "
+                "que tenga abierta esta base; después inicia una sola vez. "
+                "Si no encuentras el proceso, guarda tu trabajo y reinicia el equipo. "
+                "No borres talla.sqlite3 ni sus archivos -wal o -shm."
+            ) from exc
+        raise
+
+
+def _initialize_database(busy_timeout_ms):
+    if isinstance(busy_timeout_ms, bool) or not isinstance(busy_timeout_ms, int) or not 0 <= busy_timeout_ms <= 60000:
+        raise ValueError("El tiempo de espera SQLite debe estar entre 0 y 60000 ms.")
     UPLOADS.mkdir(parents=True, exist_ok=True)
+    LOG.info("Inicio de Talla: comprobando la base local %s", DB.resolve())
     with connect() as c:
+        c.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         c.execute("PRAGMA journal_mode=WAL")
+        LOG.info("Comprobando el esquema de la base de datos...")
         c.executescript("""
         CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), rule_mode TEXT NOT NULL, version INTEGER NOT NULL);
         INSERT OR IGNORE INTO settings(id,rule_mode,version) VALUES (1,'strict',1);
@@ -95,10 +119,19 @@ def init_db():
             if c.execute("SELECT 1 FROM skus LIMIT 1").fetchone():
                 backup_path = DATA / "talla.pre-v3.sqlite3"
                 if not backup_path.exists():
-                    with sqlite3.connect(backup_path) as backup:
-                        c.backup(backup)
+                    LOG.info("Guardando respaldo antes de actualizar el catálogo...")
+                    temporary = DATA / (".respaldo-" + uuid.uuid4().hex + ".sqlite3")
+                    try:
+                        with sqlite3.connect(temporary) as backup:
+                            c.backup(backup)
+                        os.replace(temporary, backup_path)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    LOG.info("Respaldo guardado en %s", backup_path.resolve())
             upgrade_engine(c)
+        LOG.info("Preparando consultas del catálogo...")
         create_analysis_view(c)
+    LOG.info("Base de datos lista. La aplicación está terminando de iniciar.")
 
 
 def get_settings(c):
@@ -109,6 +142,11 @@ def upgrade_engine(c):
     """Re-evaluate heuristics without discarding original data or decisions."""
     config = get_settings(c)
     category_engine = CategoryEngine.from_db(c)
+    total = c.execute("SELECT COUNT(*) FROM skus").fetchone()[0]
+    processed = 0
+    started = time.monotonic()
+    reported = started
+    LOG.info("Actualizando catálogo existente: %s SKUs. Conservando originales y aprobaciones.", f"{total:,}")
     last_id = 0
     while True:
         rows = c.execute("SELECT * FROM skus WHERE id>? ORDER BY id LIMIT 1000", (last_id,)).fetchall()
@@ -125,12 +163,19 @@ def upgrade_engine(c):
             status = ("approved" if live["state"] == "approved" else "review") if live else calc["status"]
             c.execute("UPDATE skus SET raw_hash=?,calculated=?,status=?,is_reference=? WHERE id=?", (digest, json.dumps(calc), status, int(trusted_reference(raw) and not row["reference_revoked"] and calc["core_status"] == "valid"), row["id"]))
         last_id = rows[-1]["id"]
+        processed += len(rows)
+        current_time = time.monotonic()
+        if current_time - reported >= 5 or processed == total:
+            LOG.info("Actualizando catálogo: %s / %s SKUs (%s%%), %s segundos.", f"{processed:,}", f"{total:,}", round(processed * 100 / total) if total else 100, round(current_time - started))
+            reported = current_time
+    LOG.info("Actualizando propuestas y comprobando referencias...")
     for p in c.execute("SELECT p.id,p.values_json,s.raw_json FROM proposals p JOIN skus s ON s.id=p.sku_id"):
         values = json.loads(p["values_json"])
         calc = calculate_record({**json.loads(p["raw_json"]), **values}, config["rule_mode"], config["volume_ratio_threshold"], category_engine)
         c.execute("UPDATE proposals SET candidate_hash=?,calculated=? WHERE id=?", (canonical_hash(values), json.dumps(calc), p["id"]))
     c.execute("UPDATE settings SET engine_revision=3 WHERE id=1")
     generate_proposals(c, config)
+    LOG.info("Actualización terminada: %s SKUs, %s segundos.", f"{processed:,}", round(time.monotonic() - started))
 
 
 def create_analysis_view(c):
@@ -417,12 +462,16 @@ def worker_loop():
 
 @asynccontextmanager
 async def lifespan(app):
-    init_db()
-    thread = threading.Thread(target=worker_loop, daemon=True, name="catalog-worker")
-    thread.start()
-    yield
-    TASKS.put(None)
-    thread.join(timeout=5)
+    with exclusive_instance(DATA):
+        init_db()
+        thread = threading.Thread(target=worker_loop, daemon=True, name="catalog-worker")
+        thread.start()
+        try:
+            yield
+        finally:
+            TASKS.put(None)
+            LOG.info("Cerrando Talla. Esperando a que termine el trabajo en curso...")
+            thread.join()
 
 
 app = FastAPI(title="Talla · Control logístico", lifespan=lifespan)
@@ -430,7 +479,7 @@ app = FastAPI(title="Talla · Control logístico", lifespan=lifespan)
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "external_ai": False, "mode": "local_pilot"}
+    return {"status": "ok", "external_ai": False, "mode": "local_pilot", "startup_id": os.environ.get("TALLA_STARTUP_ID", "")}
 
 
 @app.get("/api/settings")

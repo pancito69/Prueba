@@ -1,5 +1,16 @@
 TALLA · CONTROL LOGÍSTICO — PILOTO
 
+SI NO ABRE / DATABASE IS LOCKED
+- Cierra otras instancias con Ctrl+C y espera a que terminen.
+- Si no localizas la que quedó abierta, guarda tu trabajo y reinicia el equipo.
+- Abre iniciar.bat una sola vez.
+- Espera «Aplicación lista. Abre...» antes de usar el navegador.
+- No borres talla.sqlite3, -wal ni -shm. No reemplaces data/ con una carpeta vacía.
+- Para copiar data/, detén primero la aplicación que la utiliza.
+
+El inicio ahora muestra el progreso de actualización y evita dos instancias
+simultáneas sobre la misma carpeta de datos.
+
 NUEVO EN VERSIÓN 3: INVESTIGACIÓN SIN API DE PAGO
 1. Al cargar tu catálogo, asigna Categoría y Subcategoría si están disponibles.
 2. En Categorías registra rangos en kg con su justificación. No hay límites

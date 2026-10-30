@@ -3,6 +3,30 @@
 Piloto funcional para cargar un catálogo, calcular tallas, detectar diferencias,
 registrar evidencia, aprobar correcciones y exportarlas. Interfaz en español.
 
+## Si aparece "database is locked" o el navegador rechaza la conexión
+
+`database is locked` indica que SQLite no pudo acceder para escribir a esa base.
+La traza puede deberse a otra instancia o a otro programa que la tenga ocupada;
+no identifica por sí sola al proceso responsable.
+
+1. Cierra las otras ventanas de Talla con **Ctrl+C** y espera su cierre.
+2. Cierra cualquier programa que tenga abierta `talla.sqlite3`.
+3. Si no encuentras la instancia que quedó abierta, guarda tu trabajo y reinicia
+   el equipo. Abre `iniciar.bat` **una sola vez** después.
+4. No borres `talla.sqlite3`, sus archivos `-wal` o `-shm` ni reemplaces `data/`
+   con una carpeta vacía. Antes de copiar la carpeta, detén su aplicación de origen.
+
+El iniciador anuncia **"Aplicación lista. Abre..."** solamente después de comprobar
+una respuesta de la instancia que acaba de lanzar. Mientras prepara una base grande,
+la consola informa respaldo, avance de SKUs y finalización. Espera ese mensaje
+antes de abrir o recargar el navegador.
+
+La versión actual permite una sola instancia por carpeta `data/`. El archivo
+`.talla-instance.lock` permanece después del cierre, pero el sistema operativo
+libera su bloqueo; su existencia no indica un bloqueo activo y no debe eliminarse.
+Este control no puede cerrar otra versión antigua o un programa externo: ciérralo
+antes de reintentar. El cierre espera a que termine el trabajo en curso.
+
 ## Versión 3: categorías e investigación sin API de pago
 
 La aplicación no inicia sesión en ChatGPT/Claude, no envía consultas a proveedores
