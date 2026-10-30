@@ -1,5 +1,17 @@
 TALLA · CONTROL LOGÍSTICO — PILOTO
 
+CALCULAR RANGOS PARA TODAS LAS RAMAS
+1. Carga el catálogo y asigna Categoría, Subcategoría y Presentación si existen.
+2. Abre Categorías y pulsa «Calcular rangos desde mi catálogo».
+3. Espera el progreso y consulta aptas, insuficientes y protegidas.
+4. Aplica todas las sugerencias aptas como alertas en una sola acción.
+
+No necesitas escribir límites rama por rama. Los rangos derivados del catálogo
+son estadísticos provisionales, no medidas certificadas. Si hay suficientes
+referencias declaradas o correcciones aprobadas, el método las prefiere.
+Las ramas sin soporte suficiente quedan sin rango en vez de inventar límites.
+El proceso no modifica pesos, dimensiones, tallas, cobros ni aprobaciones.
+
 SI NO ABRE / DATABASE IS LOCKED
 - Cierra otras instancias con Ctrl+C y espera a que terminen.
 - Si no localizas la que quedó abierta, guarda tu trabajo y reinicia el equipo.
@@ -13,8 +25,8 @@ simultáneas sobre la misma carpeta de datos.
 
 NUEVO EN VERSIÓN 3: INVESTIGACIÓN SIN API DE PAGO
 1. Al cargar tu catálogo, asigna Categoría y Subcategoría si están disponibles.
-2. En Categorías registra rangos en kg con su justificación. No hay límites
-   comerciales inventados: debes definirlos con referencias o criterio operativo.
+2. En Categorías puedes calcular rangos masivamente; el editor manual es opcional
+   para criterios documentados de tu operación. No hay límites comerciales inventados.
 3. Consulta Diagnóstico y crea un lote en «Investigar sin API».
 4. Descarga Casos CSV e Instrucciones y adjúntalos a ChatGPT/Claude con navegación.
 5. Pide que devuelva el CSV indicado. Debe abstenerse si no encuentra evidencia.

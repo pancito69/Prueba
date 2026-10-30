@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 import zipfile
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, closing
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -26,7 +26,8 @@ from pydantic import BaseModel, Field
 
 from engine import BANDS, ValidationError, calculate, canonical_hash, identity_key, suggest_mapping, trusted_reference, normalize_billed_size, parse_number
 from reporting import diagnostics as diagnostic_report, diagnostic_rows, groups as review_groups, GROUP_KEY_SQL
-from categories import CategoryEngine, init_schema as init_category_schema, list_rules, save_rule, delete_rule
+from categories import CategoryEngine, init_schema as init_category_schema, list_rules, save_rule, delete_rule, normalize_scope
+from category_profiler import init_schema as init_profile_schema, generate as generate_profile, fingerprint as profile_fingerprint
 from research import init_schema as init_research_schema, register_routes as register_research_routes
 from startup_lock import exclusive_instance
 
@@ -113,6 +114,8 @@ def _initialize_database(busy_timeout_ms):
         c.execute("UPDATE jobs SET status='failed',error='Proceso interrumpido. Puede volver a procesar el archivo; los registros ya cargados se conservan.',finished_at=? WHERE status IN ('queued','running')", (now(),))
         init_category_schema(c)
         init_research_schema(c)
+        init_profile_schema(c)
+        c.execute("UPDATE profile_runs SET status='failed',error='El cálculo se interrumpió al cerrar la aplicación. Vuelve a calcular los rangos.',finished_at=? WHERE status IN ('queued','running')", (now(),))
         c.commit()
         if get_settings(c)["engine_revision"] < 3:
             # Preserve a recoverable pre-migration copy before touching existing rows.
@@ -122,7 +125,7 @@ def _initialize_database(busy_timeout_ms):
                     LOG.info("Guardando respaldo antes de actualizar el catálogo...")
                     temporary = DATA / (".respaldo-" + uuid.uuid4().hex + ".sqlite3")
                     try:
-                        with sqlite3.connect(temporary) as backup:
+                        with closing(sqlite3.connect(temporary)) as backup:
                             c.backup(backup)
                         os.replace(temporary, backup_path)
                     finally:
@@ -455,7 +458,10 @@ def worker_loop():
         try:
             if job_id is None:
                 return
-            process_job(job_id)
+            if job_id.startswith("category-profile:"):
+                process_category_profile(job_id.split(":", 1)[1])
+            else:
+                process_job(job_id)
         finally:
             TASKS.task_done()
 
@@ -526,7 +532,177 @@ def categories():
 @app.get("/api/category-rules")
 def category_rules():
     with connect() as c:
-        return {"items": list_rules(c)}
+        items = list_rules(c)
+        owners = {r["rule_id"]: dict(r) for r in c.execute("""SELECT a.*,s.source,s.counts_json FROM category_profile_applications a
+          JOIN profile_suggestions s ON s.id=a.suggestion_id""")}
+        for item in items:
+            owner = owners.get(item["id"])
+            if owner and owner["rule_version"] == item["version"]:
+                support = json.loads(owner["counts_json"])
+                item.update(origin=owner["source"], profile_run_id=owner["run_id"], support_count=support.get("support_count"), profile_support=support)
+            else:
+                item.update(origin="manual", profile_run_id=None, support_count=None)
+        return {"items": items}
+
+
+def process_category_profile(run_id):
+    with MUTATION, connect() as c:
+        row = c.execute("SELECT * FROM profile_runs WHERE id=?", (run_id,)).fetchone()
+        if row is None:
+            return
+        try:
+            def progress(processed, total):
+                c.execute("UPDATE profile_runs SET progress=?,total=? WHERE id=?", (processed, total, run_id))
+                c.commit()
+            generate_profile(c, run_id, json.loads(row["config_json"]), progress_callback=progress)
+            c.commit()
+        except Exception as exc:
+            c.rollback()
+            c.execute("UPDATE profile_runs SET status='failed',error=?,finished_at=? WHERE id=?", (str(exc), now(), run_id))
+            c.commit()
+
+
+def serialize_profile(c, row):
+    data = dict(row)
+    data["config"] = json.loads(data.pop("config_json") or "{}")
+    data["summary"] = json.loads(data.pop("summary_json") or "{}")
+    current = {r["state"]: r["n"] for r in c.execute("SELECT state,COUNT(*) n FROM profile_suggestions WHERE run_id=? GROUP BY state", (row["id"],))}
+    data["summary"].update(current)
+    data["summary"]["ready"] = current.get("ready", 0)
+    data["summary"]["applied"] = current.get("applied", 0)
+    return data
+
+
+class ProfileInput(BaseModel):
+    min_count: int = Field(default=30, ge=30, le=100000)
+    min_sellers: int = Field(default=3, ge=3, le=1000)
+
+
+@app.post("/api/category-profiles")
+def create_category_profile(body: ProfileInput):
+    with mutating(), connect() as c:
+        if c.execute("SELECT 1 FROM profile_runs WHERE status IN ('queued','running') LIMIT 1").fetchone():
+            raise HTTPException(409, "Ya hay un cálculo de rangos pendiente. Consulta su progreso.")
+        if not c.execute("SELECT 1 FROM skus LIMIT 1").fetchone():
+            raise HTTPException(422, "Carga primero tu catálogo para calcular rangos sobre sus categorías.")
+        if not c.execute("SELECT 1 FROM skus WHERE TRIM(COALESCE(json_extract(raw_json,'$.category'),''))<>'' LIMIT 1").fetchone():
+            raise HTTPException(422, "Tu catálogo no tiene categorías mapeadas. Vuelve a cargarlo asignando la columna Categoría; no necesitas definir sus límites manualmente.")
+        run_id = uuid.uuid4().hex
+        c.execute("INSERT INTO profile_runs(id,status,progress,total,config_json,summary_json,created_at) VALUES (?,?,?,?,?,?,?)", (run_id, "queued", 0, 0, json.dumps(body.model_dump()), "{}", now()))
+        row = c.execute("SELECT * FROM profile_runs WHERE id=?", (run_id,)).fetchone()
+        result = serialize_profile(c, row)
+    TASKS.put("category-profile:" + run_id)
+    return result
+
+
+@app.get("/api/category-profiles")
+def category_profiles():
+    with connect() as c:
+        return {"items": [serialize_profile(c, row) for row in c.execute("SELECT * FROM profile_runs ORDER BY created_at DESC,rowid DESC LIMIT 20")]}
+
+
+@app.get("/api/category-profiles/{run_id}")
+def category_profile(run_id: str):
+    with connect() as c:
+        row = c.execute("SELECT * FROM profile_runs WHERE id=?", (run_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Cálculo de rangos no encontrado.")
+        return serialize_profile(c, row)
+
+
+@app.get("/api/category-profiles/{run_id}/suggestions")
+def category_suggestions(run_id: str, page: int = 1, page_size: int = 25, state: str = "all"):
+    if page < 1 or not 1 <= page_size <= 100:
+        raise HTTPException(422, "Paginación inválida.")
+    states = {"ready", "insufficient", "degenerate", "heterogeneous", "existing_manual", "applied"}
+    if state not in states | {"all"}:
+        raise HTTPException(422, "Estado de sugerencia inválido.")
+    with connect() as c:
+        if not c.execute("SELECT 1 FROM profile_runs WHERE id=?", (run_id,)).fetchone():
+            raise HTTPException(404, "Cálculo no encontrado.")
+        where, args = "WHERE run_id=?", [run_id]
+        if state != "all":
+            where += " AND state=?"
+            args.append(state)
+        total = c.execute("SELECT COUNT(*) FROM profile_suggestions " + where, args).fetchone()[0]
+        items = []
+        for row in c.execute("SELECT * FROM profile_suggestions " + where + " ORDER BY CASE state WHEN 'ready' THEN 0 ELSE 1 END,category,subcategory,presentation LIMIT ? OFFSET ?", [*args, page_size, (page - 1) * page_size]):
+            item = dict(row)
+            for field in ("counts", "bounds", "method"):
+                item[field] = json.loads(item.pop(field + "_json") or "{}")
+            items.append(item)
+        return {"items": items, "total": total, "page": page, "pages": max(1, (total + page_size - 1) // page_size)}
+
+
+@app.get("/api/category-profiles/{run_id}/suggestions.csv")
+def category_suggestions_csv(run_id: str):
+    with connect() as c:
+        if not c.execute("SELECT 1 FROM profile_runs WHERE id=?", (run_id,)).fetchone():
+            raise HTTPException(404, "Cálculo no encontrado.")
+    def rows():
+        yield ["Categoría", "Subcategoría", "Presentación", "Estado", "Origen", "Peso real mínimo kg", "Peso real máximo kg", "Volumétrico mínimo kg", "Volumétrico máximo kg", "Soporte", "Método", "Motivo", "Regla aplicada"]
+        with connect() as c:
+            for row in c.execute("SELECT * FROM profile_suggestions WHERE run_id=? ORDER BY category,subcategory,presentation", (run_id,)):
+                bounds = json.loads(row["bounds_json"] or "{}")
+                yield [row["category"], row["subcategory"], row["presentation"], row["state"], row["source"], *(bounds.get(key, "") for key in ("real_min_kg", "real_max_kg", "volume_min_kg", "volume_max_kg")), row["counts_json"], row["method_json"], row["reason"], row["applied_rule_id"]]
+    return csv_response(rows(), "rangos_propuestos_por_categoria.csv")
+
+
+class ProfileApplyInput(BaseModel):
+    suggestion_ids: list[int] = Field(default_factory=list, max_length=10000)
+    all_ready: bool = False
+    attestation: bool = False
+
+
+@app.post("/api/category-profiles/{run_id}/apply")
+def apply_category_suggestions(run_id: str, body: ProfileApplyInput):
+    if not body.attestation:
+        raise HTTPException(422, "Confirma que estos rangos solo generan alertas de plausibilidad y no verifican medidas ni corrigen cobros.")
+    if body.all_ready == bool(body.suggestion_ids):
+        raise HTTPException(422, "Selecciona sugerencias o elige todas las aptas, mediante una sola modalidad.")
+    if len(set(body.suggestion_ids)) != len(body.suggestion_ids):
+        raise HTTPException(422, "La selección contiene sugerencias repetidas.")
+    with mutating(), connect() as c:
+        run = c.execute("SELECT * FROM profile_runs WHERE id=?", (run_id,)).fetchone()
+        if run is None:
+            raise HTTPException(404, "Cálculo no encontrado.")
+        if run["status"] != "completed":
+            raise HTTPException(409, "El cálculo no ha terminado correctamente.")
+        if profile_fingerprint(c, get_settings(c)) != run["dataset_hash"]:
+            raise HTTPException(409, "El catálogo, las reglas de talla o las aprobaciones cambiaron. Vuelve a calcular los rangos antes de aplicarlos.")
+        condition, args = "run_id=? AND state='ready'", [run_id]
+        if not body.all_ready:
+            condition += " AND id IN (" + ",".join("?" for _ in body.suggestion_ids) + ")"
+            args.extend(body.suggestion_ids)
+        suggestions = c.execute("SELECT * FROM profile_suggestions WHERE " + condition, args).fetchall()
+        if not body.all_ready and len(suggestions) != len(body.suggestion_ids):
+            raise HTTPException(409, "La selección incluye sugerencias ajenas, ya aplicadas o no aptas.")
+        # A more-specific generated rule must not displace a manual broad rule.
+        owned = {r["rule_id"]: r["rule_version"] for r in c.execute("SELECT rule_id,rule_version FROM category_profile_applications")}
+        existing = c.execute("SELECT * FROM category_rules").fetchall()
+        manual = [r for r in existing if owned.get(r["id"]) != r["version"]]
+        protected = applied = 0
+        for row in suggestions:
+            category = normalize_scope(row["category"])
+            subcategory = normalize_scope(row["subcategory"])
+            presentation = normalize_scope(row["presentation"])
+            overlaps = any(r["category_key"] == category and (not r["subcategory_key"] or not subcategory or r["subcategory_key"] == subcategory) and (not r["presentation_key"] or not presentation or r["presentation_key"] == presentation) for r in manual)
+            if overlaps:
+                c.execute("UPDATE profile_suggestions SET state='existing_manual',reason=? WHERE id=?", ("Ámbito protegido por una regla manual compatible; no se reemplaza ni se desplaza.", row["id"]))
+                protected += 1
+                continue
+            bounds = json.loads(row["bounds_json"])
+            counts = json.loads(row["counts_json"])
+            note = ("Rango de plausibilidad automático. " + ("Soporte de referencias declaradas o correcciones aprobadas. " if row["source"] == "declared_references" else "Estadístico provisional del catálogo; medidas no verificadas. ") + "No imputa medidas ni corrige tallas o cobros. " + f"Perfil {run_id}; soporte real={counts.get('real_support_count', 0)}, volumétrico={counts.get('volume_support_count', 0)}. Consulte el perfil para método y exclusiones.")
+            rule_data = {"category": row["category"], "subcategory": row["subcategory"], "presentation": row["presentation"], **bounds, "note": note, "enabled": True}
+            previous = next((r for r in existing if r["category_key"] == category and r["subcategory_key"] == subcategory and r["presentation_key"] == presentation), None)
+            rule = save_rule(c, rule_data, previous["id"] if previous else None)
+            c.execute("INSERT INTO category_profile_applications(rule_id,run_id,suggestion_id,rule_version) VALUES (?,?,?,?) ON CONFLICT(rule_id) DO UPDATE SET run_id=excluded.run_id,suggestion_id=excluded.suggestion_id,rule_version=excluded.rule_version", (rule["id"], run_id, row["id"], rule["version"]))
+            c.execute("UPDATE profile_suggestions SET state='applied',applied_rule_id=? WHERE id=?", (rule["id"], row["id"]))
+            applied += 1
+        recalculated = recalculate_category_checks(c) if applied else 0
+        c.execute("INSERT INTO configuration_events(action,detail,created_at) VALUES (?,?,?)", ("category_profile_applied", json.dumps({"run_id": run_id, "applied": applied, "protected_manual": protected}), now()))
+        return {"applied": applied, "skipped": protected, "protected_manual": protected, "recalculated": recalculated}
 
 
 def write_category_rule(body, rule_id=None):

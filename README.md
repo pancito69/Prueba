@@ -3,6 +3,68 @@
 Piloto funcional para cargar un catálogo, calcular tallas, detectar diferencias,
 registrar evidencia, aprobar correcciones y exportarlas. Interfaz en español.
 
+## Calcular los rangos de todas las categorías sin definirlos manualmente
+
+En **Categorías → Calcular rangos desde mi catálogo**, pulsa el botón de cálculo.
+El trabajo se realiza en tu computadora, sobre la base que ya cargaste y sin API.
+No necesitas escribir mínimos y máximos rama por rama.
+
+1. Comprueba que el catálogo tenga mapeada Categoría y, si existe, Subcategoría y
+   Presentación. Si faltan, vuelve a importar el archivo asignando esas columnas.
+2. Pulsa **Calcular rangos** y espera el progreso. Se evalúan los ámbitos presentes
+   y la población completa a la que correspondería cada regla.
+3. Consulta los resultados: **Apta**, **Sin soporte suficiente**, **Sin variación
+   suficiente**, **Demasiado heterogénea** o **Protegida por regla manual**.
+4. Puedes exportar el diagnóstico y **aplicar todas las propuestas aptas de una
+   vez**, tras aceptar que generan alertas estadísticas, no medidas verificadas.
+   El catálogo se recalcula una sola vez para ese lote.
+
+### Qué significa el origen de cada rango
+
+- **Con soporte declarado:** hay suficientes referencias declaradas o correcciones
+  aprobadas vigentes para esa métrica. La herramienta no las certificó físicamente.
+- **Estadístico provisional del catálogo:** describe patrones de datos registrados
+  que todavía pueden estar equivocados. No se presenta como un límite físico real.
+- **Sin propuesta:** no se inventa un mínimo cuando falta soporte, hay valores muy
+  repetidos o la categoría es demasiado diversa. Cada métrica puede abstenerse por
+  separado: un rango de peso real no rellena un rango volumétrico desconocido.
+
+Los errores comunes a toda una categoría, como una unidad mal registrada en todos
+sus productos, pueden pasar inadvertidos. Tener muchos sellers tampoco demuestra
+fuentes independientes. La validación física o documental sigue siendo necesaria
+para afirmar que una medida y una talla son correctas.
+
+### Método auditable y conservador
+
+Se pondera una vez cada identidad compatible y se excluyen, por métrica, identidades
+con valores contradictorios dentro de su cohorte. Si falta identidad suficiente se
+cuenta el SKU como entidad y se advierte que no equivale a un producto único verificado.
+Las referencias se separan del catálogo común para que una fila sin respaldo no
+invalide por sí sola un ancla declarada.
+
+El método usa valores positivos dentro del dominio operativo de hasta 500 kg,
+cuartiles en `log10` y cercas exteriores `Q1 − 3·IQR`, `Q3 + 3·IQR`, transformadas
+a kg y redondeadas hacia fuera. Los huecos de la tabla de tallas no invalidan pesos
+para esta estadística. Se conserva soporte, fuente, exclusiones, cuantiles y método.
+Una métrica física disponible puede analizarse aunque otra falte, sin completar el
+registro ni su talla.
+
+Los umbrales iniciales de 30 entidades y 3 sellers para el catálogo son requisitos
+operativos, **no garantías de exactitud**. IQR nulo o concentración de al menos 80 %
+provocan abstención; un IQR logarítmico superior a 2 indica demasiada heterogeneidad.
+Una presentación o subcategoría vacía cubre todos los valores compatibles y se
+entrena sobre esa población completa, nunca solo sobre filas con campos vacíos.
+
+Las reglas manuales se protegen incluso por solapamiento de ámbitos. Editar una
+regla generada la convierte en manual para futuras aplicaciones automáticas.
+Si cambian el catálogo, sus aprobaciones o las reglas de talla después del cálculo,
+se exige generar un perfil nuevo antes de activar sus sugerencias. Ninguna aplicación
+modifica pesos, dimensiones, tallas ni aprobaciones; solo actualiza alertas.
+
+El catálogo real del usuario sigue en su computadora: los rangos específicos solo
+se obtienen al ejecutar el botón sobre esa base. Los archivos de prueba del repositorio
+no contienen sus 646.396 SKUs.
+
 ## Si aparece "database is locked" o el navegador rechaza la conexión
 
 `database is locked` indica que SQLite no pudo acceder para escribir a esa base.
@@ -40,10 +102,9 @@ de tu cuenta; la aplicación no genera consumo de API.
 1. **Carga las categorías.** En el mapeo del catálogo asigna `category` y, si existe,
    `subcategory`. Si el catálogo cargado antes no contenía esos campos, vuelve a
    importar asignando sus columnas. No se deducen desde el nombre del producto.
-2. **Define reglas en Categorías.** Introduce mínimos/máximos de peso real y
-   volumétrico en **kg**, junto con su justificación. Puedes limitar el alcance a
-   una subcategoría y presentación. Campos de alcance vacíos abarcan todas sus
-   variantes explícitamente. Prevalece la regla más específica.
+2. **Calcula los rangos en Categorías.** Usa el cálculo automático masivo para
+   proponer alertas. El editor manual es opcional para políticas documentadas de
+   tu operación, con mínimos/máximos en **kg** y su justificación.
 3. **Consulta Diagnóstico.** Los valores bajos/altos son candidatos: una regla no
    sustituye medidas, no asigna el promedio y no certifica qué valor es correcto.
    Las reglas comienzan vacías porque no se inventaron límites comerciales.
